@@ -455,8 +455,8 @@ template<
   int PARTITION_SIZE>
 __global__ void paged_attention_v2_reduce_kernel(
   scalar_t* __restrict__ out,             // [num_seqs, num_heads, head_size]
-  const float* __restrict__ exp_sums,     // [num_seqs, num_heads, max_num_partitions]
-  const float* __restrict__ max_logits,   // [num_seqs, num_heads, max_num_partitions]
+  float* __restrict__ exp_sums,     // [num_seqs, num_heads, max_num_partitions]
+  float* __restrict__ max_logits,   // [num_seqs, num_heads, max_num_partitions]
   const scalar_t* __restrict__ tmp_out,   // [num_seqs, num_heads, max_num_partitions, head_size]
   const int* __restrict__ context_lens,   // [num_seqs]
   const int max_num_partitions) {
@@ -544,6 +544,14 @@ __global__ void paged_attention_v2_reduce_kernel(
     }
     from_float(out_ptr[i], acc);
   }
+
+  // Note(Soo): Copy global max_logit and exp_sum for "Distributed" PagedAttention
+  float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions
+                                 + head_idx * max_num_partitions;
+  *exp_sums_ptr = global_exp_sum
+  float* max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions
+                                     + head_idx * max_num_partitions;
+  *max_logits = max_logit
 }
 
 } // namespace vllm

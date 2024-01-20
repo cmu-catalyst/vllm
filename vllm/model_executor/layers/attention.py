@@ -220,6 +220,7 @@ def _paged_attention(
     max_num_partitions = (
         (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
         _PARTITION_SIZE)
+
     # NOTE(woosuk): We use a simple heuristic to decide whether to use
     # PagedAttention V1 or V2. If the number of partitions is 1, we use
     # V1 to avoid the overhead of reduction. Also, if the number of
@@ -227,51 +228,67 @@ def _paged_attention(
     # to parallelize.
     # TODO(woosuk): Tune this heuristic.
     # For context len > 8192, use V2 kernel to avoid shared memory shortage.
-    use_v1 = input_metadata.max_context_len <= 8192 and (
-        max_num_partitions == 1 or num_seqs * num_heads > 512)
-    if use_v1:
-        # Run PagedAttention V1.
-        ops.paged_attention_v1(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            num_kv_heads,
-            scale,
-            input_metadata.block_tables,
-            input_metadata.context_lens,
-            block_size,
-            input_metadata.max_context_len,
-            alibi_slopes,
-        )
-    else:
-        # Run PagedAttention V2.
-        assert _PARTITION_SIZE % block_size == 0
-        tmp_output = torch.empty(
-            size=(num_seqs, num_heads, max_num_partitions, head_size),
-            dtype=output.dtype,
-            device=output.device,
-        )
-        exp_sums = torch.empty(
-            size=(num_seqs, num_heads, max_num_partitions),
-            dtype=torch.float32,
-            device=output.device,
-        )
-        max_logits = torch.empty_like(exp_sums)
-        ops.paged_attention_v2(
-            output,
-            exp_sums,
-            max_logits,
-            tmp_output,
-            query,
-            key_cache,
-            value_cache,
-            num_kv_heads,
-            scale,
-            input_metadata.block_tables,
-            input_metadata.context_lens,
-            block_size,
-            input_metadata.max_context_len,
-            alibi_slopes,
-        )
+    # use_v1 = input_metadata.max_context_len <= 8192 and (
+    #     max_num_partitions == 1 or num_seqs * num_heads > 512)
+    # if use_v1:
+    #     # Run PagedAttention V1.
+    #     ops.paged_attention_v1(
+    #         output,
+    #         query,
+    #         key_cache,
+    #         value_cache,
+    #         num_kv_heads,
+    #         scale,
+    #         input_metadata.block_tables,
+    #         input_metadata.context_lens,
+    #         block_size,
+    #         input_metadata.max_context_len,
+    #         alibi_slopes,
+    #     )
+    # else:
+
+    # NOTE(Soo): We only use V2 (Flash Decoding) for our use case
+    # Run PagedAttention V2.
+    assert _PARTITION_SIZE % block_size == 0
+    tmp_output = torch.empty(
+        size=(num_seqs, num_heads, max_num_partitions, head_size),
+        dtype=output.dtype,
+        device=output.device,
+    )
+    exp_sums = torch.empty(
+        size=(num_seqs, num_heads, max_num_partitions),
+        dtype=torch.float32,
+        device=output.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
+    ops.paged_attention_v2(
+        output,
+        exp_sums,
+        max_logits,
+        tmp_output,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        input_metadata.block_tables,
+        input_metadata.context_lens,
+        block_size,
+        input_metadata.max_context_len,
+        alibi_slopes,
+    )
+
+    # NOTE(Soo): Output shapes after our "Distributed" PagedAttetnion are
+    # output: (num_seqs, num_heads, head_size)
+    # exp_sums: (num_seqs, num_heads, 1)
+    # max_logits: (num_seqs, num_heads, 1)
+
+    # TODO(Soo): Add communication to reduce attention output
+    # print("Output: ")
+    # print(output)
+    # print("Exp sum: ")
+    # print(exp_sums)
+    # print("Max Logits: ")
+    # print(max_logits)
+
     return output
