@@ -279,6 +279,10 @@ def test_paged_attention(
     )
 
     # TODO(Soo): Reduce two "Distributed" attentions to verify max_logits / exp_sums
+    exp_sums_1 = exp_sums_1[:,:,0].contiguous()
+    exp_sums_2 = exp_sums_2[:, :, 0].contiguous()
+    max_logits_1 = max_logits_1[:, :, 0].contiguous()
+    max_logits_2 = max_logits_2[:, :, 0].contiguous()
     global_max_logits = torch.empty(
         size=(num_seqs, num_heads),
         dtype=torch.float32,
@@ -288,13 +292,12 @@ def test_paged_attention(
     global_output = torch.empty_like(query)
     for i in range(num_seqs):
         for j in range(num_heads):
-            global_max_logits[i][j] = max(max_logits_1[i][j][0], max_logits_2[i][j][0])
-            new_exp_sum_1 = exp_sums_1[i][j][0] * math.exp(max_logits_1[i][j][0] - global_max_logits[i][j])
-            new_exp_sum_2 = exp_sums_2[i][j][0] * math.exp(max_logits_2[i][j][0] - global_max_logits[i][j])
+            global_max_logits[i][j] = max(max_logits_1[i][j], max_logits_2[i][j])
+            new_exp_sum_1 = exp_sums_1[i][j] * math.exp(max_logits_1[i][j] - global_max_logits[i][j])
+            new_exp_sum_2 = exp_sums_2[i][j] * math.exp(max_logits_2[i][j] - global_max_logits[i][j])
             global_exp_sum[i][j] = new_exp_sum_1 + new_exp_sum_2
-            for k in range(head_size):
-                global_output[i][j][k] = output_1[i][j][k] * new_exp_sum_1 / global_exp_sum[i][j]
-                global_output[i][j][k] += output_2[i][j][k] * new_exp_sum_2 / global_exp_sum[i][j]
+            global_output[i][j] = output_1[i][j] * new_exp_sum_1 / global_exp_sum[i][j]
+            global_output[i][j] += output_2[i][j] * new_exp_sum_2 / global_exp_sum[i][j]
 
     # NOTE(woosuk): Due to the kernel-level differences in the two
     # implementations, there is a small numerical difference in the two
