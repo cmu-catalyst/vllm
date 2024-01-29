@@ -1,12 +1,61 @@
+import copy
 import os
 import torch
 import numpy as np
+from typing import Any, Dict, List
 
 from transformers import LlamaConfig
 from cache_parallel_llm import CacheParallelDecodeLlamaAttention
+from data_parallel_llm import DataParallelDecodeLlamaAttention
 from synthetic_data_utils import gen_random_kv_cache, gen_model_input_metadata
 from eval_logger import EvaluationLogger, EvaluationConfig
 
+def get_model_by_parallelism_type(
+        p_type: str,
+        model_args: Dict[str, Any],
+):
+    attn = None
+    device = model_args["device"]
+
+    if p_type == "cp":
+        model_args["cp_size"] = model_args["n_gpus"]
+        del model_args["n_gpus"]
+        attn = CacheParallelDecodeLlamaAttention(**model_args)
+        attn = attn.to(device)
+    elif p_type == "dp":
+        model_args["dp_size"] = model_args["n_gpus"]
+        del model_args["n_gpus"]
+        attn = DataParallelDecodeLlamaAttention(**model_args)
+        attn = attn.to(device)
+    elif p_type == "tp":
+        raise NotImplementedError("TP is not ready")
+    else:
+        raise ValueError("Invalid parallelism type")
+
+    return attn
+
+def adjust_configs_by_parallelism_type(
+        cfg: EvaluationConfig,
+        context_lens: List[int],
+        rank: int,
+):
+    p_type = cfg.p_type
+    if p_type == "cp":
+        context_lens = context_lens // cfg.n_gpus
+    elif p_type == "dp":
+        cfg.num_seqs = cfg.num_seqs // cfg.n_gpus
+
+        start_idx = rank * cfg.num_seqs
+        end_idx = rank * cfg.num_seqs + cfg.num_seqs
+        context_lens = context_lens[start_idx:end_idx]
+    elif p_type == "tp":
+        raise NotImplementedError("TP is not ready")
+    else:
+        raise ValueError("Invalid parallelism type")
+
+    return cfg, context_lens
+
+@torch.inference_mode()
 def run_local_model(
         rank: int,
         cfg: EvaluationConfig,
@@ -32,17 +81,26 @@ def run_local_model(
     rope_scaling = getattr(llama_cfg, "rope_scaling", None)
     max_position_embeddings = getattr(llama_cfg, "max_position_embeddings", 8192)
 
-    attn = CacheParallelDecodeLlamaAttention(
-        cp_size=cfg.n_gpus,
-        device=device,
-        dtype=cfg.dtype,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        rope_theta=rope_theta,
-        rope_scaling=rope_scaling,
-        max_position_embeddings=max_position_embeddings,
+    cfg, context_lens = adjust_configs_by_parallelism_type(
+        cfg=cfg,
+        context_lens=context_lens,
+        rank=rank,
     )
+    cfg.max_kv_cache_context_len = max(context_lens.cpu().numpy())
+
+    model_args = {
+        "n_gpus": cfg.n_gpus,
+        "device": device,
+        "dtype": cfg.dtype,
+        "hidden_size": hidden_size,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "rope_theta": rope_theta,
+        "rope_scaling": rope_scaling,
+        "max_position_embeddings": max_position_embeddings,
+    }
+
+    attn = get_model_by_parallelism_type(cfg.p_type, model_args)
 
     # Initialize hidden states
     scale = float(1.0 / (head_size ** 0.5))
@@ -76,7 +134,6 @@ def run_local_model(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-
         output = attn(hidden_states, kv_cache, input_metadata)
 
         end_event.record()
@@ -112,7 +169,6 @@ def save_result_to_file(
     # Saving the results to a file
     eval_logger.save_results()
 
-
 def run_distributed_model(
         rank: int,
         eval_cfg: EvaluationConfig,
@@ -124,16 +180,30 @@ def run_distributed_model(
                                          rank=rank,
                                          world_size=eval_cfg.n_gpus)
     torch.cuda.device(rank)
+    init_cfg = copy.deepcopy(eval_cfg)
 
     # Run models
     avg_latency_ms = run_local_model(rank, eval_cfg)
 
     # Log results
     if rank == 0:
-        save_result_to_file(eval_cfg, avg_latency_ms)
+        # Use init_cfg instead of eval_cfg since eval_cfg will change
+        # depending on parallelism type
+        save_result_to_file(init_cfg, avg_latency_ms)
 
     # Clean up
     torch.distributed.destroy_process_group()
+
+
+def check_eval_configs(
+    cfg: EvaluationConfig,
+):
+    # FIXME(Soo): Enable imbalanced situation for all parallelism types
+    # It currently assumes ideal situation for all parallleisms
+    assert cfg.max_kv_cache_context_len % cfg.n_gpus == 0 # CP
+    assert cfg.num_seqs % cfg.n_gpus == 0 # DP
+    num_heads = cfg.llama_cfg.num_attention_heads
+    assert num_heads % cfg.n_gpus == 0  # TP
 
 if __name__ == "__main__":
     # Evaluation config
@@ -149,7 +219,7 @@ if __name__ == "__main__":
         # Model configs
         dtype = torch.bfloat16,
         model_name = "Llama-7B",
-        num_seqs = 1,
+        num_seqs = 4,
         # FIXME(Soo): Push context_len to the boundary for long context setup
         max_kv_cache_context_len = 2000,
         num_layers = 1,
@@ -163,11 +233,13 @@ if __name__ == "__main__":
     )
 
     p_types = ["cp"]
-    max_kv_cache_context_lens = [2000, 4000]
+    # p_types = ["dp"]
+    max_kv_cache_context_lens = [8000, 16000]
     for p_type in p_types:
         for cache_len in max_kv_cache_context_lens:
             eval_cfg.p_type = p_type
             eval_cfg.max_kv_cache_context_len = cache_len
+            check_eval_configs(eval_cfg)
             torch.multiprocessing.spawn(run_distributed_model,
                                         args=(eval_cfg,),
                                         nprocs=eval_cfg.n_gpus,
