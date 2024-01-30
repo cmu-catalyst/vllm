@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 from transformers import LlamaConfig
 from cache_parallel_llm import CacheParallelDecodeLlamaAttention
 from data_parallel_llm import DataParallelDecodeLlamaAttention
+from tensor_parallel_llm import TensorParallelDecodeLlamaAttention
 from synthetic_data_utils import gen_random_kv_cache, gen_model_input_metadata
 from eval_logger import EvaluationLogger, EvaluationConfig
 
@@ -28,7 +29,10 @@ def get_model_by_parallelism_type(
         attn = DataParallelDecodeLlamaAttention(**model_args)
         attn = attn.to(device)
     elif p_type == "tp":
-        raise NotImplementedError("TP is not ready")
+        model_args["tp_size"] = model_args["n_gpus"]
+        del model_args["n_gpus"]
+        attn = TensorParallelDecodeLlamaAttention(**model_args)
+        attn = attn.to(device)
     else:
         raise ValueError("Invalid parallelism type")
 
@@ -49,7 +53,7 @@ def adjust_configs_by_parallelism_type(
         end_idx = rank * cfg.num_seqs + cfg.num_seqs
         context_lens = context_lens[start_idx:end_idx]
     elif p_type == "tp":
-        raise NotImplementedError("TP is not ready")
+        pass
     else:
         raise ValueError("Invalid parallelism type")
 
@@ -232,7 +236,8 @@ if __name__ == "__main__":
         partition_size = 512,
     )
 
-    p_types = ["cp"]
+    p_types = ["tp", "cp"]
+    # p_types = ["cp"]
     # p_types = ["dp"]
     max_kv_cache_context_lens = [8000, 16000]
     for p_type in p_types:
