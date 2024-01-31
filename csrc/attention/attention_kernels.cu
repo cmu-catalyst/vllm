@@ -460,6 +460,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   const scalar_t* __restrict__ tmp_out,   // [num_seqs, num_heads, max_num_partitions, head_size]
   const int* __restrict__ context_lens,   // [num_seqs]
   const int max_num_partitions) {
+
   const int num_heads = gridDim.x;
   const int head_idx = blockIdx.x;
   const int seq_idx = blockIdx.y;
@@ -546,12 +547,107 @@ __global__ void paged_attention_v2_reduce_kernel(
   }
 
   // Note(Soo): Copy global max_logit and exp_sum for "Distributed" PagedAttention
-  float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions
-                                 + head_idx * max_num_partitions;
-  *exp_sums_ptr = global_exp_sum
-  float* max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions
-                                     + head_idx * max_num_partitions;
-  *max_logits = max_logit
+  float* max_logits_ptr2 = max_logits + seq_idx * num_heads * max_num_partitions
+                                           + head_idx * max_num_partitions;
+  float* exp_sums_ptr2 = exp_sums + seq_idx * num_heads * max_num_partitions
+                                       + head_idx * max_num_partitions;
+  max_logits_ptr2[0] = max_logit;
+  exp_sums_ptr2[0] = global_exp_sum;
+}
+
+template<
+  typename scalar_t,
+  int HEAD_SIZE,
+  int NUM_THREADS>
+__global__ void distributed_paged_attention_v2_reduce_kernel(
+  scalar_t* __restrict__ out,                // [num_seqs, num_heads, head_size]
+  float* __restrict__ exp_sums,              // [num_seqs, num_heads, num_device]
+  float* __restrict__ max_logits,            // [num_seqs, num_heads, num_device]
+  const scalar_t* __restrict__ local_outs,   // [num_seqs, num_heads, num_device, head_size]
+  const int num_devices) {
+
+  const int num_heads = gridDim.x;
+  const int head_idx = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  if (num_devices == 1) {
+    // No need to reduce. Only copy local_outs to out.
+    scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+    const scalar_t* local_outs_ptr = local_outs + seq_idx * num_heads * HEAD_SIZE
+                                                + head_idx * HEAD_SIZE;
+    for (int i = threadIdx.x; i < HEAD_SIZE; i += blockDim.x) {
+      out_ptr[i] = local_outs_ptr[i];
+    }
+    // Terminate the thread block.
+    return;
+  }
+
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  const int warp_idx = threadIdx.x / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+
+  // Size: 2 * num_devices.
+  extern __shared__ char shared_mem[];
+  // Workspace for reduction.
+  __shared__ float red_smem[2 * NUM_WARPS];
+
+  // Load max logits to shared memory.
+  float* shared_max_logits = reinterpret_cast<float*>(shared_mem);
+  const float* max_logits_ptr = max_logits + seq_idx * num_heads * num_devices
+                                           + head_idx * num_devices;
+  float max_logit = -FLT_MAX;
+  for (int i = threadIdx.x; i < num_devices; i += blockDim.x) {
+    const float l = max_logits_ptr[i];
+    shared_max_logits[i] = l;
+    max_logit = fmaxf(max_logit, l);
+  }
+  __syncthreads();
+
+  // Get the global max logit.
+  // Reduce within the warp.
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
+  }
+  if (lane == 0) {
+    red_smem[warp_idx] = max_logit;
+  }
+  __syncthreads();
+  // Reduce across warps.
+  max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
+  }
+  // Broadcast the max value to all threads.
+  max_logit = VLLM_SHFL_SYNC(max_logit, 0);
+
+  // Load rescaled exp sums to shared memory.
+  float* shared_exp_sums = reinterpret_cast<float*>(shared_mem + sizeof(float) * num_devices);
+  const float* exp_sums_ptr = exp_sums + seq_idx * num_heads * num_devices
+                                       + head_idx * num_devices;
+  float global_exp_sum = 0.0f;
+  for (int i = threadIdx.x; i < num_devices; i += blockDim.x) {
+    float l = shared_max_logits[i];
+    float rescaled_exp_sum = exp_sums_ptr[i] * expf(l - max_logit);
+    global_exp_sum += rescaled_exp_sum;
+    shared_exp_sums[i] = rescaled_exp_sum;
+  }
+  __syncthreads();
+  global_exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], global_exp_sum);
+  const float inv_global_exp_sum = __fdividef(1.0f, global_exp_sum + 1e-6f);
+
+  // Aggregate local_outs to out.
+  const scalar_t* local_outs_ptr = local_outs + seq_idx * num_heads * num_devices * HEAD_SIZE
+                                              + head_idx * num_devices * HEAD_SIZE;
+  scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+#pragma unroll
+  for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
+    float acc = 0.0f;
+    for (int j = 0; j < num_devices; ++j) {
+      acc += to_float(local_outs_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] * inv_global_exp_sum;
+    }
+    from_float(out_ptr[i], acc);
+  }
 }
 
 } // namespace vllm
@@ -882,6 +978,78 @@ void paged_attention_v2(
   } else {
     TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
   }
+}
+
+template<
+  typename T,
+  int HEAD_SIZE,
+  int NUM_THREADS = 128>
+void distributed_paged_attention_v2_reduce_launcher(
+  torch::Tensor& out,
+  torch::Tensor& exp_sums,
+  torch::Tensor& max_logits,
+  torch::Tensor& local_outs,
+  int num_devices) {
+
+  int num_seqs = out.size(0);
+  int num_heads = out.size(1);
+
+  dim3 reduce_grid(num_heads, num_seqs);
+  dim3 block(NUM_THREADS);
+  int reduce_shared_mem_size = 2 * num_devices * sizeof(float);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
+  float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
+  float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
+  T* local_outs_ptr = reinterpret_cast<T*>(local_outs.data_ptr());
+
+  vllm::distributed_paged_attention_v2_reduce_kernel<T, HEAD_SIZE, NUM_THREADS>               \
+  <<<reduce_grid, block, reduce_shared_mem_size, stream>>>(                                   \
+    out_ptr,                                                                                  \
+    exp_sums_ptr,                                                                             \
+    max_logits_ptr,                                                                           \
+    local_outs_ptr,                                                                              \
+    num_devices);
+}
+
+#define CALL_DISTRIBUTED_V2_REDUCE_LAUNCHER(T, HEAD_SIZE)           \
+  distributed_paged_attention_v2_reduce_launcher<T, HEAD_SIZE>(     \
+    out,                                                            \
+    exp_sums,                                                       \
+    max_logits,                                                     \
+    local_outs,                                                     \
+    num_devices);
+
+#define CALL_DISTRIBUTED_V2_REDUCE_LAUNCHER_HEAD_SIZE(T)            \
+  switch (head_size) {                                              \
+    case 128:                                                       \
+      CALL_DISTRIBUTED_V2_REDUCE_LAUNCHER(T, 128);                  \
+      break;                                                        \
+    default:                                                        \
+      TORCH_CHECK(false, "Unsupported head size: ", head_size);   \
+      break;                                                        \
+  }
+
+void distributed_paged_attention_v2_reduce(
+  torch::Tensor& out,             // [num_seqs, num_heads, head_size]
+  torch::Tensor& exp_sums,        // [num_seqs, num_heads, num_devices]
+  torch::Tensor& max_logits,      // [num_seqs, num_heads, num_devices]
+  torch::Tensor& local_outs,      // [num_seqs, num_heads, num_devices, head_size]
+  int num_devices) {
+
+  const int head_size = out.size(2);
+
+  if (out.dtype() == at::ScalarType::Float) {
+    CALL_DISTRIBUTED_V2_REDUCE_LAUNCHER_HEAD_SIZE(float);
+  } else if (out.dtype() == at::ScalarType::Half) {
+    CALL_DISTRIBUTED_V2_REDUCE_LAUNCHER_HEAD_SIZE(uint16_t);
+  } else if (out.dtype() == at::ScalarType::BFloat16) {
+    CALL_DISTRIBUTED_V2_REDUCE_LAUNCHER_HEAD_SIZE(__nv_bfloat16);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type: ", out.dtype());
+  }
+
 }
 
 #undef WARP_SIZE

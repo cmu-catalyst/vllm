@@ -96,23 +96,19 @@ def _distributed_paged_attention(
     torch.distributed.all_gather(max_logits_list, max_logits)
     torch.distributed.all_gather(exp_sums_list, exp_sums)
     torch.distributed.all_gather(output_list, output)
-    global_output = torch.zeros_like(output)
-    for i in range(num_seqs):
-        for j in range(num_heads):
-            global_max_logit = max_logits_list[0][i][j]
-            global_exp_sum = exp_sums_list[0][i][j]
-            global_output[i][j] = output_list[0][i][j]
-            for dev_id in range(1, world_size):
-                prev_global_max_logit = global_max_logit
-                max_logit_val = max_logits_list[dev_id][i][j]
-                global_max_logit = max(global_max_logit, max_logit_val)
 
-                new_global_exp_sum = global_exp_sum * math.exp(prev_global_max_logit - global_max_logit)
-                global_exp_sum = new_global_exp_sum.clone()
-                local_exp_sum = exp_sums_list[dev_id][i][j] * math.exp(max_logit_val - global_max_logit)
-                global_exp_sum += local_exp_sum
-                global_output[i][j] = global_output[i][j] * new_global_exp_sum / global_exp_sum
-                global_output[i][j] += output_list[dev_id][i][j] * local_exp_sum / global_exp_sum
+    max_logits_list = torch.stack(max_logits_list, dim=-1)
+    exp_sums_list = torch.stack(exp_sums_list, dim=-1)
+    output_list = torch.stack(output_list, dim=-2)
+
+    global_output = torch.zeros_like(output)
+    ops.distributed_paged_attention_v2_reduce(
+        global_output,
+        exp_sums_list,
+        max_logits_list,
+        output_list,
+        world_size
+    )
 
     return global_output
 

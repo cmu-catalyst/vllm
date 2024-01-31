@@ -42,11 +42,11 @@ FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # - 512 as a buffer
 # - Shared memory here is per CUDA block (that executes on a single SM)
 # MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
-MAX_SEQ_LEN = 1000 # To boost unit test, it is set lower than original MAX
+MAX_SEQ_LEN = 10000 # To boost unit test, it is set lower than original MAX
 NUM_BLOCKS = 5000  # Arbitrary values for testing
 PARTITION_SIZE = 512 # Used for parallel KV cache load in FlashInfer
 
-DTYPES = [torch.bfloat16] #, torch.float]
+DTYPES = [torch.float] #, torch.bfloat16]
 NUM_GEN_SEQS = [2, 4]  # Arbitrary values for testing
 NUM_HEADS = [(32, 32)]  # LLaMA-7B
 HEAD_SIZES = [128] # LLaMA-7B
@@ -195,27 +195,23 @@ def distributed_run(
     max_logits_list = [torch.empty_like(max_logits) for _ in range(world_size)]
     output_list = [torch.empty_like(output) for _ in range(world_size)]
 
-    # # TODO(Soo): Reduce results
+    # Reduce results
     torch.distributed.all_gather(max_logits_list, max_logits)
     torch.distributed.all_gather(exp_sums_list, exp_sums)
     torch.distributed.all_gather(output_list, output)
-    global_output = torch.zeros_like(output)
-    for i in range(num_seqs):
-        for j in range(num_heads):
-            global_max_logit = max_logits_list[0][i][j]
-            global_exp_sum = exp_sums_list[0][i][j]
-            global_output[i][j] = output_list[0][i][j]
-            for dev_id in range(1, world_size):
-                prev_global_max_logit = global_max_logit
-                max_logit_val = max_logits_list[dev_id][i][j]
-                global_max_logit = max(global_max_logit, max_logit_val)
 
-                new_global_exp_sum = global_exp_sum * math.exp(prev_global_max_logit - global_max_logit)
-                global_exp_sum = new_global_exp_sum.clone()
-                local_exp_sum = exp_sums_list[dev_id][i][j] * math.exp(max_logit_val - global_max_logit)
-                global_exp_sum += local_exp_sum
-                global_output[i][j] = global_output[i][j] * new_global_exp_sum / global_exp_sum
-                global_output[i][j] += output_list[dev_id][i][j] * local_exp_sum / global_exp_sum
+    max_logits_list = torch.stack(max_logits_list, dim=-1)
+    exp_sums_list = torch.stack(exp_sums_list, dim=-1)
+    output_list = torch.stack(output_list, dim=-2)
+
+    global_output = torch.zeros_like(output)
+    ops.distributed_paged_attention_v2_reduce(
+        global_output,
+        exp_sums_list,
+        max_logits_list,
+        output_list,
+        world_size
+    )
 
     ref_output = ref_output.to(gpu_id)
     assert torch.allclose(global_output, ref_output, atol=1e-3, rtol=1e-5)

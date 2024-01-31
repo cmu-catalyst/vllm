@@ -31,6 +31,14 @@ void paged_attention_v2(
   int max_context_len,
   const c10::optional<torch::Tensor>& alibi_slopes);
 
+void distributed_paged_attention_v2_reduce(
+  torch::Tensor& out,
+  torch::Tensor& exp_sums,
+  torch::Tensor& max_logits,
+  torch::Tensor& local_outs,
+  int num_devices);
+
+
 void rms_norm(
   torch::Tensor& out,
   torch::Tensor& input,
