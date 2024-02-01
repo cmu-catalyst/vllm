@@ -1,42 +1,18 @@
-import math
-import os
-import random
 from typing import Any, Dict, List, Optional, Tuple
 
-import pytest
 import torch
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
-
-from vllm._C import ops
-from vllm.utils import get_max_shared_memory_bytes
-
 import torch.distributed
-from torch.distributed import ReduceOp
 from torch import nn
 
-from vllm.model_executor.input_metadata import InputMetadata
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttention
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (LinearMethodBase,
-                                               MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear)
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding, ParallelLMHead)
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size)
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.model_executor.weight_utils import (default_weight_loader,
-                                              hf_model_weights_iterator)
-from vllm.sequence import SamplerOutput
-
+from vllm.model_executor.input_metadata import InputMetadata
+from vllm._C import ops
+from vllm.utils import get_max_shared_memory_bytes
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm._C import cache_ops
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+from llama_llm import LlamaDecodeAttention, KVCache
+
 _PARTITION_SIZE = 512
 
 def _distributed_paged_attention(
@@ -194,66 +170,15 @@ class DistributedPagedAttention(nn.Module):
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
 
-class CacheParallelDecodeLlamaAttention(nn.Module):
 
-    def __init__(
-        self,
-        cp_size: int, # degree of cache parallelism
-        device: torch.device,
-        dtype: torch.dtype,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-    ) -> None:
-        super().__init__()
-        torch.cuda.device(device)
+class CacheParallelDecodeLlamaAttention(LlamaDecodeAttention):
 
-        self.hidden_size = hidden_size
-        self.cp_size = cp_size
-        # tp_size = get_tensor_model_parallel_world_size()
+    def __init__(self, **kargs) -> None:
+        super().__init__(**kargs)
 
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        assert hidden_size % self.num_heads == 0, "This should hold to work"
-        self.head_dim = hidden_size // self.num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
-
-        # TODO(Soo): Modify the following to work for cache parallelism size
-        # if self.num_kv_heads >= tp_size:
-        #     # Number of KV heads is greater than TP size, so we partition
-        #     # the KV heads across multiple tensor parallel GPUs.
-        #     assert self.num_kv_heads % tp_size == 0
-        # else:
-        #     # Number of KV heads is less than TP size, so we replicate
-        #     # the KV heads across multiple tensor parallel GPUs.
-        #     assert tp_size % self.num_kv_heads == 0
-
-        # NOTE(Soo): Replicate an activation (thus a new query to all devices)
-        # > All projections (QKV, Output) are equivalent to the data-parallel case
         # FIXME(Soo): Keep new KV cache to only one of ranks
-        self.qkv_proj = nn.Linear(self.hidden_size, self.q_size + 2 * self.kv_size,
-                                  device=device, dtype=dtype)
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size,
-                                device=device, dtype=dtype)
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-
-        # TODO(Soo): Implement distributed Paged Attention
         self.attn = DistributedPagedAttention(
-            cp_size=self.cp_size,
+            cp_size=self.n_gpus,
             num_heads=self.num_heads,
             head_size=self.head_dim,
             scale=self.scaling,
@@ -267,14 +192,7 @@ class CacheParallelDecodeLlamaAttention(nn.Module):
         kv_cache: KVCache,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        # Replicated qkv projection across GPUs
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # NOTE(Soo): Replicate an activation (thus a new query to all devices)
+        output = super().forward(hidden_states, kv_cache, input_metadata)
 
-        # FIXME(Soo): Enable rotary embedding
-        # q, k = self.rotary_emb(positions, q, k)
-
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
-        output = self.o_proj(attn_output)
         return output

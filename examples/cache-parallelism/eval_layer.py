@@ -19,23 +19,15 @@ def get_model_by_parallelism_type(
     device = model_args["device"]
 
     if p_type == "cp":
-        model_args["cp_size"] = model_args["n_gpus"]
-        del model_args["n_gpus"]
         attn = CacheParallelDecodeLlamaAttention(**model_args)
-        attn = attn.to(device)
     elif p_type == "dp":
-        model_args["dp_size"] = model_args["n_gpus"]
-        del model_args["n_gpus"]
         attn = DataParallelDecodeLlamaAttention(**model_args)
-        attn = attn.to(device)
     elif p_type == "tp":
-        model_args["tp_size"] = model_args["n_gpus"]
-        del model_args["n_gpus"]
         attn = TensorParallelDecodeLlamaAttention(**model_args)
-        attn = attn.to(device)
     else:
         raise ValueError("Invalid parallelism type")
 
+    attn = attn.to(device)
     return attn
 
 def adjust_configs_by_parallelism_type(
@@ -149,6 +141,7 @@ def run_local_model(
         # print(f"Rank: {rank} / {world_size} done - output shape: {output.shape}")
         # print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
 
+
     arr_elapsed_time_ms = arr_elapsed_time_ms[cfg.n_warmup_iters:]
     avg_elapsed_time_ms = np.mean(arr_elapsed_time_ms)
     print(f"Avg Elapsed time ({rank}): {avg_elapsed_time_ms} ms")
@@ -214,8 +207,8 @@ if __name__ == "__main__":
     eval_cfg = EvaluationConfig(
         # Evaluation configs
         n_gpus = 4,
-        n_eval_iters = 10,
-        n_warmup_iters = 3,
+        n_eval_iters = 20,
+        n_warmup_iters = 10,
         output_file_path = "/home/byungsoj/eval_results/result.json",
         rand_seed = 0,
         p_type="cp",
@@ -223,23 +216,29 @@ if __name__ == "__main__":
         # Model configs
         dtype = torch.bfloat16,
         model_name = "Llama-7B",
-        num_seqs = 4,
-        # FIXME(Soo): Push context_len to the boundary for long context setup
+        num_seqs = 16,
+
         max_kv_cache_context_len = 2000,
         num_layers = 1,
         llama_cfg = LlamaConfig(), # Load Llama-7B configurations
 
         # vLLM configs
-        # FIXME(Soo): Push num_blocks to the boundary for long context setup
-        num_blocks = 30000,
+        # Note(Soo): 90000 is max # of blocks for single attn in Catalyst cluster
+        num_blocks = 90000,
         block_size = 16,
         partition_size = 512,
     )
 
-    p_types = ["tp", "cp"]
+    # p_types = ["tp", "dp", "cp"]
     # p_types = ["cp"]
-    # p_types = ["dp"]
-    max_kv_cache_context_lens = [8000, 16000]
+    p_types = ["tp", "dp", "cp"]
+    # p_types = ["tp"]
+
+    # Note(Soo): 320000 is max context len for 4 GPUs in Catalyst cluster
+    # with batch size of 4
+    # max_kv_cache_context_lens = [320000]
+    # max_kv_cache_context_lens = [2500, 5000, 10000, 20000, 40000, 80000]
+    max_kv_cache_context_lens = [2500]
     for p_type in p_types:
         for cache_len in max_kv_cache_context_lens:
             eval_cfg.p_type = p_type
