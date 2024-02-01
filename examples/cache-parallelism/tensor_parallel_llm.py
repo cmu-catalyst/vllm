@@ -109,9 +109,9 @@ class TensorParallelDecodeLlamaAttention(nn.Module):
 
         k_cache, v_cache = kv_cache
         attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
-        output = self.o_proj(attn_output)
+        output = self.o_proj(attn_outpu
 
         # All-reduce on output
-        # torch.distributed.all_reduce(output)
+        torch.distributed.all_reduce(output)
 
         return output
