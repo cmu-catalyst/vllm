@@ -48,11 +48,11 @@ def gen_random_kv_cache(
     key_caches, value_caches = create_kv_caches(
         num_blocks, block_size, num_layers, num_kv_heads, head_size, dtype, seed, device)
 
-    # FIXME(Soo): It only picks first layer for now
-    assert num_layers == 1, "It needs to be modified if num_layers != 1"
-    key_cache, value_cache = key_caches[0], value_caches[0]
+    kv_caches = []
+    for k_cache, v_cache in zip(key_caches, value_caches):
+        kv_caches.append((k_cache, v_cache))
 
-    return (key_cache, value_cache)
+    return kv_caches
 
 def gen_block_table_and_slot_mapping(num_seqs, context_lens, block_size, device):
     # FIXME(Soo): Later, adjust to make it work for increasing KV cache size over iters

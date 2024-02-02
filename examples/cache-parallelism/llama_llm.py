@@ -94,3 +94,111 @@ class LlamaDecodeAttention(nn.Module):
         output = self.o_proj(attn_output)
 
         return output
+
+class LlamaMLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.ffn1 = nn.Linear(hidden_size, intermediate_size*2, device=device, dtype=dtype)
+        self.ffn2 = nn.Linear(intermediate_size, hidden_size, device=device, dtype=dtype)
+
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        x = self.ffn1(x)
+        x = self.act_fn(x)
+        x = self.ffn2(x)
+        return x
+
+class LlamaDecoderLayer(nn.Module):
+
+    def __init__(self, **kargs) -> None:
+        super().__init__()
+
+        self.mlp = LlamaMLP(
+            hidden_size=kargs["hidden_size"],
+            intermediate_size=kargs["intermediate_size"],
+            device=kargs["device"],
+            dtype=kargs["dtype"],
+        )
+        # self.input_layernorm = RMSNorm(config.hidden_size,
+        #                                eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = RMSNorm(config.hidden_size,
+        #                                         eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        # positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        # residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
+        # if residual is None:
+        #     residual = hidden_states
+        #     hidden_states = self.input_layernorm(hidden_states)
+        # else:
+        #     hidden_states, residual = self.input_layernorm(
+        #         hidden_states, residual)
+        hidden_states = self.self_attn(
+            # positions=positions,
+            hidden_states=hidden_states,
+            kv_cache=kv_cache,
+            input_metadata=input_metadata,
+        )
+
+        # Fully Connected
+        # hidden_states, residual = self.post_attention_layernorm(
+        #     hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states #, residual
+
+class LlamaModel(nn.Module):
+    def __init__(self, **kargs) -> None:
+        super().__init__()
+        # self.config = config
+        # self.padding_idx = config.pad_token_id
+        # self.vocab_size = config.vocab_size
+        # self.embed_tokens = VocabParallelEmbedding(
+        #     config.vocab_size,
+        #     config.hidden_size,
+        # )
+        layer_cls = kargs["layer_cls"]
+        num_layers = kargs["num_layers"]
+        del kargs["layer_cls"]
+        del kargs["num_layers"]
+        self.layers = nn.ModuleList([
+            layer_cls(**kargs) for _ in range(num_layers)
+        ])
+        # self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        # input_ids: torch.Tensor,
+        # positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        # hidden_states = self.embed_tokens(input_ids)
+        # residual = None
+        for i in range(len(self.layers)):
+            layer = self.layers[i]
+            hidden_states = layer(hidden_states, kv_caches[i], input_metadata)
+            # hidden_states, residual = layer(
+            #     positions,
+            #     hidden_states,
+            #     kv_caches[i],
+            #     input_metadata,
+            #     residual,
+            # )
+        # hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states

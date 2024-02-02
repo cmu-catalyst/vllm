@@ -5,7 +5,7 @@ import torch.distributed
 from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.input_metadata import InputMetadata
 
-from llama_llm import LlamaDecodeAttention, KVCache
+from llama_llm import LlamaDecoderLayer, LlamaDecodeAttention, KVCache
 
 class TensorParallelDecodeLlamaAttention(LlamaDecodeAttention):
 
@@ -44,4 +44,27 @@ class TensorParallelDecodeLlamaAttention(LlamaDecodeAttention):
         # All-reduce on output
         torch.distributed.all_reduce(output)
 
+        return output
+
+class TensorParallelDecodeLlamaLayer(LlamaDecoderLayer):
+
+    def __init__(self, **kargs) -> None:
+        kargs["intermediate_size"] = kargs["intermediate_size"] // kargs["n_gpus"]
+        super().__init__(**kargs)
+
+        del kargs["intermediate_size"]
+        self.self_attn = TensorParallelDecodeLlamaAttention(**kargs)
+
+    def forward(
+        self,
+        # positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+
+        output = super().forward(hidden_states, kv_cache, input_metadata)
+
+        # All-reduce on output
+        torch.distributed.all_reduce(output)
         return output

@@ -11,7 +11,7 @@ from vllm.utils import get_max_shared_memory_bytes
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm._C import cache_ops
 
-from llama_llm import LlamaDecodeAttention, KVCache
+from llama_llm import LlamaDecoderLayer, LlamaDecodeAttention, KVCache
 
 _PARTITION_SIZE = 512
 
@@ -193,6 +193,26 @@ class CacheParallelDecodeLlamaAttention(LlamaDecodeAttention):
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         # NOTE(Soo): Replicate an activation (thus a new query to all devices)
+        output = super().forward(hidden_states, kv_cache, input_metadata)
+
+        return output
+
+class CacheParallelDecodeLlamaLayer(LlamaDecoderLayer):
+
+    def __init__(self, **kargs) -> None:
+        super().__init__(**kargs)
+
+        del kargs["intermediate_size"]
+        self.self_attn = CacheParallelDecodeLlamaAttention(**kargs)
+
+    def forward(
+        self,
+        # positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+
         output = super().forward(hidden_states, kv_cache, input_metadata)
 
         return output

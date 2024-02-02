@@ -5,13 +5,55 @@ import numpy as np
 from typing import Any, Dict, List
 
 from transformers import LlamaConfig
-from cache_parallel_llm import CacheParallelDecodeLlamaAttention
-from data_parallel_llm import DataParallelDecodeLlamaAttention
-from tensor_parallel_llm import TensorParallelDecodeLlamaAttention
+from llama_llm import LlamaModel
+from cache_parallel_llm import CacheParallelDecodeLlamaAttention, CacheParallelDecodeLlamaLayer
+from data_parallel_llm import DataParallelDecodeLlamaAttention, DataParallelDecodeLlamaLayer
+from tensor_parallel_llm import TensorParallelDecodeLlamaAttention, TensorParallelDecodeLlamaLayer
 from synthetic_data_utils import gen_random_kv_cache, gen_model_input_metadata
 from eval_logger import EvaluationLogger, EvaluationConfig
 
+
 def get_model_by_parallelism_type(
+        p_type: str,
+        model_args: Dict[str, Any],
+):
+    model = None
+    device = model_args["device"]
+
+    p_type_to_layer_cls = {
+        "cp": CacheParallelDecodeLlamaLayer,
+        "dp": DataParallelDecodeLlamaLayer,
+        "tp": TensorParallelDecodeLlamaLayer
+    }
+    if p_type not in p_type_to_layer_cls:
+        raise ValueError("Invalid parallelism type")
+    model_args["layer_cls"] = p_type_to_layer_cls[p_type]
+
+    model = LlamaModel(**model_args)
+    model = model.to(device)
+
+    return model
+
+def get_layer_by_parallelism_type(
+        p_type: str,
+        model_args: Dict[str, Any],
+):
+    model = None
+    device = model_args["device"]
+
+    if p_type == "cp":
+        model = CacheParallelDecodeLlamaLayer(**model_args)
+    elif p_type == "dp":
+        model = DataParallelDecodeLlamaLayer(**model_args)
+    elif p_type == "tp":
+        model = TensorParallelDecodeLlamaLayer(**model_args)
+    else:
+        raise ValueError("Invalid parallelism type")
+
+    model = model.to(device)
+    return model
+
+def get_attn_by_parallelism_type(
         p_type: str,
         model_args: Dict[str, Any],
 ):
@@ -96,7 +138,17 @@ def run_local_model(
         "max_position_embeddings": max_position_embeddings,
     }
 
-    attn = get_model_by_parallelism_type(cfg.p_type, model_args)
+    # assert cfg.num_layers == 1
+    # model = get_attn_by_parallelism_type(cfg.p_type, model_args)
+
+    # assert cfg.num_layers == 1
+    # model_args["intermediate_size"] = llama_cfg.intermediate_size
+    # model = get_layer_by_parallelism_type(cfg.p_type, model_args)
+
+    model_args["intermediate_size"] = llama_cfg.intermediate_size
+    model_args["num_layers"] = cfg.num_layers
+    model = get_model_by_parallelism_type(cfg.p_type, model_args)
+
 
     # Initialize hidden states
     scale = float(1.0 / (head_size ** 0.5))
@@ -104,7 +156,7 @@ def run_local_model(
                                 dtype=cfg.dtype, device=device)
     hidden_states.uniform_(-scale, scale)
 
-    kv_cache = gen_random_kv_cache(
+    kv_caches = gen_random_kv_cache(
         num_blocks=cfg.num_blocks,
         block_size=cfg.block_size,
         num_layers=cfg.num_layers,
@@ -114,6 +166,10 @@ def run_local_model(
         seed=cfg.rand_seed,
         device=device,
     )
+    # Note(Soo): Hack
+    if not isinstance(model, LlamaModel):
+        kv_caches = kv_caches[0]
+
     input_metadata = gen_model_input_metadata(
         cfg.num_seqs,
         context_lens,
@@ -130,7 +186,7 @@ def run_local_model(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        output = attn(hidden_states, kv_cache, input_metadata)
+        output = model(hidden_states, kv_caches, input_metadata)
 
         end_event.record()
         torch.cuda.synchronize()
@@ -219,23 +275,25 @@ if __name__ == "__main__":
         num_seqs = 16,
 
         max_kv_cache_context_len = 2000,
-        num_layers = 1,
+        # num_layers = 1,
+        num_layers = 32,
         llama_cfg = LlamaConfig(), # Load Llama-7B configurations
 
         # vLLM configs
-        # Note(Soo): 90000 is max # of blocks for single attn in Catalyst cluster
-        num_blocks = 90000,
+        # FIXME(Soo): Automatically decide # blocks based on available CUDA memory
+        # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster)
+        # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
+        num_blocks = 500,
         block_size = 16,
         partition_size = 512,
     )
 
-    # p_types = ["tp", "dp", "cp"]
+    p_types = ["cp", "tp", "dp"]
     # p_types = ["cp"]
-    p_types = ["tp", "dp", "cp"]
+    # p_types = ["tp", "dp", "cp"]
     # p_types = ["tp"]
 
-    # Note(Soo): 320000 is max context len for 4 GPUs in Catalyst cluster
-    # with batch size of 4
+    # Note(Soo): 320000 is max context len for 4 GPUs in Catalyst cluster (batch size: 4, 1 layer)
     # max_kv_cache_context_lens = [320000]
     # max_kv_cache_context_lens = [2500, 5000, 10000, 20000, 40000, 80000]
     max_kv_cache_context_lens = [2500]
