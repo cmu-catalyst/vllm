@@ -74,7 +74,7 @@ class EvaluationLogger:
         if seq_len not in self.results[model][batch_size]:
             self.results[model][batch_size][seq_len] = {}
 
-        self.results[model][batch_size][seq_len][p_type] = round(measurement, 4)
+        self.results[model][batch_size][seq_len][p_type] = round(measurement, 2)
         self.results[model][batch_size][seq_len] = dict(sorted(self.results[model][batch_size][seq_len].items()))
 
     def save_results(self):

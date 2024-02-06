@@ -16,6 +16,7 @@ from llama_llm import LlamaDecoderLayer, LlamaDecodeAttention, KVCache
 _PARTITION_SIZE = 512
 
 def _distributed_paged_attention(
+    rank: int,
     world_size: int,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -62,11 +63,17 @@ def _distributed_paged_attention(
         alibi_slopes,
     )
 
-    exp_sums = exp_sums[:, :, 0].contiguous()
-    max_logits = max_logits[:, :, 0].contiguous()
+    num_seqs_per_rank = num_seqs // world_size
+    seq_idx_st =  rank * num_seqs_per_rank
+    seq_idx_end = seq_idx_st + num_seqs_per_rank
+
+    exp_sums = exp_sums[seq_idx_st:seq_idx_end, :, 0].contiguous()
+    max_logits = max_logits[seq_idx_st:seq_idx_end, :, 0].contiguous()
+    output = output[seq_idx_st:seq_idx_end, :, :]
+
     exp_sums_list = [torch.empty_like(exp_sums) for _ in range(world_size)]
     max_logits_list = [torch.empty_like(max_logits) for _ in range(world_size)]
-    output_list = [torch.empty_like(output) for _ in range(world_size)]
+    output_list = [torch.empty_like(output) for _ in range(world_size)] #  [num_seqs, num_heads, head_size]
 
     # Note(Soo): Reduce results
     torch.distributed.all_gather(max_logits_list, max_logits)
@@ -95,6 +102,7 @@ class DistributedPagedAttention(nn.Module):
         num_heads: int,
         head_size: int,
         scale: float,
+        rank: int,
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
@@ -110,6 +118,7 @@ class DistributedPagedAttention(nn.Module):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.alibi_slopes = alibi_slopes
+        self.rank = rank
 
     def forward(
         self,
@@ -157,6 +166,7 @@ class DistributedPagedAttention(nn.Module):
 
         # Decoding run.
         output = _distributed_paged_attention(
+            self.rank,
             self.cp_size,
             query,
             key_cache,
@@ -168,7 +178,7 @@ class DistributedPagedAttention(nn.Module):
         )
 
         # Reshape the output tensor.
-        return output.view(batch_size, seq_len, hidden_size)
+        return output.view(output.shape[0], seq_len, hidden_size)
 
 
 class CacheParallelDecodeLlamaAttention(LlamaDecodeAttention):
@@ -183,7 +193,9 @@ class CacheParallelDecodeLlamaAttention(LlamaDecodeAttention):
             head_size=self.head_dim,
             scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
+            rank=self.rank
         )
+        self.do_all_gather = True
 
     def forward(
         self,

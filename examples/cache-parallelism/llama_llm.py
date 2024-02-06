@@ -30,6 +30,7 @@ class LlamaDecodeAttention(nn.Module):
     def __init__(
         self,
         n_gpus: int,
+        rank: int,
         device: torch.device,
         dtype: torch.dtype,
         hidden_size: int,
@@ -47,6 +48,7 @@ class LlamaDecodeAttention(nn.Module):
 
         self.hidden_size = hidden_size
         self.n_gpus = n_gpus
+        self.rank = rank
         # tp_size = get_tensor_model_parallel_world_size()
 
         self.num_heads = num_heads
@@ -75,6 +77,8 @@ class LlamaDecodeAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
+        self.do_all_gather = False
+
     def forward(
         self,
         # positions: torch.Tensor,
@@ -84,8 +88,13 @@ class LlamaDecodeAttention(nn.Module):
     ) -> torch.Tensor:
         # Replicated qkv projection across GPUs
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        if self.do_all_gather:
+            qkv_list = [torch.empty_like(qkv) for _ in range(self.n_gpus)]
+            torch.distributed.all_gather(qkv_list, qkv)
+            qkv = torch.cat(qkv_list, dim=0)
+
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # FIXME(Soo): Enable rotary embedding
         # q, k = self.rotary_emb(positions, q, k)
 

@@ -91,6 +91,11 @@ def adjust_configs_by_parallelism_type(
     else:
         raise ValueError("Invalid parallelism type")
 
+    # NOTE(Soo): Check if it goes beyond our KV cache block size
+    total_tokens = sum(context_lens)
+    tp_divisor = cfg.n_gpus if p_type == "tp" else 1
+    assert total_tokens / tp_divisor <= cfg.num_blocks * cfg.block_size, "KV cache OOM"
+
     return cfg, context_lens
 
 @torch.inference_mode()
@@ -115,6 +120,7 @@ def run_local_model(
     num_heads = llama_cfg.num_attention_heads
     num_kv_heads = llama_cfg.num_key_value_heads
     head_size = hidden_size // num_heads
+
     rope_theta = getattr(llama_cfg, "rope_theta", 10000)
     rope_scaling = getattr(llama_cfg, "rope_scaling", None)
     max_position_embeddings = getattr(llama_cfg, "max_position_embeddings", 8192)
@@ -128,6 +134,7 @@ def run_local_model(
 
     model_args = {
         "n_gpus": cfg.n_gpus,
+        "rank": rank,
         "device": device,
         "dtype": cfg.dtype,
         "hidden_size": hidden_size,
@@ -141,18 +148,19 @@ def run_local_model(
     # assert cfg.num_layers == 1
     # model = get_attn_by_parallelism_type(cfg.p_type, model_args)
 
-    # assert cfg.num_layers == 1
-    # model_args["intermediate_size"] = llama_cfg.intermediate_size
-    # model = get_layer_by_parallelism_type(cfg.p_type, model_args)
-
+    assert cfg.num_layers == 1
     model_args["intermediate_size"] = llama_cfg.intermediate_size
-    model_args["num_layers"] = cfg.num_layers
-    model = get_model_by_parallelism_type(cfg.p_type, model_args)
+    model = get_layer_by_parallelism_type(cfg.p_type, model_args)
+
+    # model_args["intermediate_size"] = llama_cfg.intermediate_size
+    # model_args["num_layers"] = cfg.num_layers
+    # model = get_model_by_parallelism_type(cfg.p_type, model_args)
 
 
     # Initialize hidden states
     scale = float(1.0 / (head_size ** 0.5))
-    hidden_states = torch.empty(cfg.num_seqs, decode_context_len, hidden_size,
+    input_num_seqs = cfg.num_seqs // cfg.n_gpus if cfg.p_type == "cp" else cfg.num_seqs
+    hidden_states = torch.empty(input_num_seqs, decode_context_len, hidden_size,
                                 dtype=cfg.dtype, device=device)
     hidden_states.uniform_(-scale, scale)
 
@@ -160,7 +168,7 @@ def run_local_model(
         num_blocks=cfg.num_blocks,
         block_size=cfg.block_size,
         num_layers=cfg.num_layers,
-        num_kv_heads=num_kv_heads,
+        num_kv_heads=num_kv_heads if cfg.p_type != "tp" else num_kv_heads // cfg.n_gpus,
         head_size=head_size,
         dtype=cfg.dtype,
         seed=cfg.rand_seed,
@@ -169,7 +177,6 @@ def run_local_model(
     # Note(Soo): Hack
     if not isinstance(model, LlamaModel):
         kv_caches = kv_caches[0]
-
     input_metadata = gen_model_input_metadata(
         cfg.num_seqs,
         context_lens,
@@ -186,6 +193,7 @@ def run_local_model(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
+
         output = model(hidden_states, kv_caches, input_metadata)
 
         end_event.record()
@@ -197,10 +205,10 @@ def run_local_model(
         # print(f"Rank: {rank} / {world_size} done - output shape: {output.shape}")
         # print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
 
-
     arr_elapsed_time_ms = arr_elapsed_time_ms[cfg.n_warmup_iters:]
     avg_elapsed_time_ms = np.mean(arr_elapsed_time_ms)
-    print(f"Avg Elapsed time ({rank}): {avg_elapsed_time_ms} ms")
+    if rank == 0:
+        print(f"[{cfg.p_type}] Avg Elapsed time ({rank}): {avg_elapsed_time_ms:.3f} ms")
 
     return avg_elapsed_time_ms
 
@@ -237,12 +245,14 @@ def run_distributed_model(
 
     # Run models
     avg_latency_ms = run_local_model(rank, eval_cfg)
+    n_tokens_per_sec = init_cfg.num_seqs / (avg_latency_ms / 1000.0)
 
     # Log results
     if rank == 0:
         # Use init_cfg instead of eval_cfg since eval_cfg will change
         # depending on parallelism type
-        save_result_to_file(init_cfg, avg_latency_ms)
+        # save_result_to_file(init_cfg, avg_latency_ms)
+        save_result_to_file(init_cfg, n_tokens_per_sec)
 
     # Clean up
     torch.distributed.destroy_process_group()
@@ -272,31 +282,35 @@ if __name__ == "__main__":
         # Model configs
         dtype = torch.bfloat16,
         model_name = "Llama-7B",
-        num_seqs = 16,
+        num_seqs = 32,
 
         max_kv_cache_context_len = 2000,
-        # num_layers = 1,
-        num_layers = 32,
+        # num_layers = 32,
+        num_layers = 1,
         llama_cfg = LlamaConfig(), # Load Llama-7B configurations
 
         # vLLM configs
         # FIXME(Soo): Automatically decide # blocks based on available CUDA memory
-        # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster)
+        # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster, 16 seqs)
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
-        num_blocks = 500,
+        # num_blocks = 1000,
+        num_blocks=80000,
         block_size = 16,
         partition_size = 512,
     )
 
     p_types = ["cp", "tp", "dp"]
     # p_types = ["cp"]
-    # p_types = ["tp", "dp", "cp"]
+    # p_types = ["dp"]
     # p_types = ["tp"]
 
     # Note(Soo): 320000 is max context len for 4 GPUs in Catalyst cluster (batch size: 4, 1 layer)
     # max_kv_cache_context_lens = [320000]
     # max_kv_cache_context_lens = [2500, 5000, 10000, 20000, 40000, 80000]
-    max_kv_cache_context_lens = [2500]
+    # max_kv_cache_context_lens = [100, 500, 1000, 2500, 4000]
+    # max_kv_cache_context_lens = [100, 500, 1000, 2500, 5000, 7500, 10000, 12500, 15000]
+    max_kv_cache_context_lens = [40000]
+
     for p_type in p_types:
         for cache_len in max_kv_cache_context_lens:
             eval_cfg.p_type = p_type
