@@ -64,6 +64,7 @@ class EvaluationLogger:
         # To match the data type of keys read from JSON file
         # This prevents adding two same key to a dictionary
         batch_size, seq_len = str(batch_size), str(seq_len)
+        avg_latency_ms, n_tokens_per_sec = measurement
 
         if model not in self.results:
             self.results[model] = {}
@@ -74,7 +75,7 @@ class EvaluationLogger:
         if seq_len not in self.results[model][batch_size]:
             self.results[model][batch_size][seq_len] = {}
 
-        self.results[model][batch_size][seq_len][p_type] = round(measurement, 2)
+        self.results[model][batch_size][seq_len][p_type] = (round(avg_latency_ms, 3), int(n_tokens_per_sec))
         self.results[model][batch_size][seq_len] = dict(sorted(self.results[model][batch_size][seq_len].items()))
 
     def save_results(self):

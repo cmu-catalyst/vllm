@@ -2,7 +2,7 @@ import copy
 import os
 import torch
 import numpy as np
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from transformers import LlamaConfig
 from llama_llm import LlamaModel
@@ -214,7 +214,7 @@ def run_local_model(
 
 def save_result_to_file(
         cfg: EvaluationConfig,
-        measurement: float,
+        measurement: Tuple[float, float],
 ):
     eval_logger = EvaluationLogger(cfg.output_file_path)
 
@@ -252,7 +252,7 @@ def run_distributed_model(
         # Use init_cfg instead of eval_cfg since eval_cfg will change
         # depending on parallelism type
         # save_result_to_file(init_cfg, avg_latency_ms)
-        save_result_to_file(init_cfg, n_tokens_per_sec)
+        save_result_to_file(init_cfg, (avg_latency_ms, n_tokens_per_sec))
 
     # Clean up
     torch.distributed.destroy_process_group()
@@ -282,7 +282,7 @@ if __name__ == "__main__":
         # Model configs
         dtype = torch.bfloat16,
         model_name = "Llama-7B",
-        num_seqs = 32,
+        num_seqs = 1024, # num_seqs * max_kv_cache_context_lens should be less than 1280000
 
         max_kv_cache_context_len = 2000,
         # num_layers = 32,
@@ -291,10 +291,10 @@ if __name__ == "__main__":
 
         # vLLM configs
         # FIXME(Soo): Automatically decide # blocks based on available CUDA memory
-        # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster, 16 seqs)
+        # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster, 16 seqs); should be 80000 with bs of 1024
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
         # num_blocks = 1000,
-        num_blocks=80000,
+        num_blocks = 80000,
         block_size = 16,
         partition_size = 512,
     )
@@ -309,7 +309,7 @@ if __name__ == "__main__":
     # max_kv_cache_context_lens = [2500, 5000, 10000, 20000, 40000, 80000]
     # max_kv_cache_context_lens = [100, 500, 1000, 2500, 4000]
     # max_kv_cache_context_lens = [100, 500, 1000, 2500, 5000, 7500, 10000, 12500, 15000]
-    max_kv_cache_context_lens = [40000]
+    max_kv_cache_context_lens = [i for i in range(100, 1281, 100)]
 
     for p_type in p_types:
         for cache_len in max_kv_cache_context_lens:
