@@ -92,9 +92,9 @@ def adjust_configs_by_parallelism_type(
         raise ValueError("Invalid parallelism type")
 
     # NOTE(Soo): Check if it goes beyond our KV cache block size
-    total_tokens = sum(context_lens)
-    tp_divisor = cfg.n_gpus if p_type == "tp" else 1
-    assert total_tokens / tp_divisor <= cfg.num_blocks * cfg.block_size, "KV cache OOM"
+    # total_tokens = sum(context_lens)
+    # tp_divisor = cfg.n_gpus if p_type == "tp" else 1
+    # assert total_tokens / tp_divisor <= cfg.num_blocks * cfg.block_size, "KV cache OOM"
 
     return cfg, context_lens
 
@@ -178,6 +178,7 @@ def run_local_model(
     if not isinstance(model, LlamaModel):
         kv_caches = kv_caches[0]
     input_metadata = gen_model_input_metadata(
+        cfg.num_blocks,
         cfg.num_seqs,
         context_lens,
         cfg.max_kv_cache_context_len,
@@ -304,19 +305,19 @@ if __name__ == "__main__":
     # p_types = ["dp"]
     # p_types = ["tp"]
 
-    # Note(Soo): 320000 is max context len for 4 GPUs in Catalyst cluster (batch size: 4, 1 layer)
-    # max_kv_cache_context_lens = [320000]
-    # max_kv_cache_context_lens = [2500, 5000, 10000, 20000, 40000, 80000]
-    # max_kv_cache_context_lens = [100, 500, 1000, 2500, 4000]
-    # max_kv_cache_context_lens = [100, 500, 1000, 2500, 5000, 7500, 10000, 12500, 15000]
-    max_kv_cache_context_lens = [i for i in range(100, 1281, 100)]
+    # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
+    max_kv_cache_context_lens = [i for i in range(10000, 100001, 10000)]
+    num_seqs_arr = [16, 128, 1024]
 
-    for p_type in p_types:
+    for n_seqs in num_seqs_arr:
         for cache_len in max_kv_cache_context_lens:
-            eval_cfg.p_type = p_type
-            eval_cfg.max_kv_cache_context_len = cache_len
-            check_eval_configs(eval_cfg)
-            torch.multiprocessing.spawn(run_distributed_model,
-                                        args=(eval_cfg,),
-                                        nprocs=eval_cfg.n_gpus,
-                                        join=True)
+            for p_type in p_types:
+                eval_cfg.p_type = p_type
+                eval_cfg.max_kv_cache_context_len = cache_len
+                eval_cfg.num_seqs = n_seqs
+
+                check_eval_configs(eval_cfg)
+                torch.multiprocessing.spawn(run_distributed_model,
+                                            args=(eval_cfg,),
+                                            nprocs=eval_cfg.n_gpus,
+                                            join=True)

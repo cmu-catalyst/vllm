@@ -54,18 +54,19 @@ def gen_random_kv_cache(
 
     return kv_caches
 
-def gen_block_table_and_slot_mapping(num_seqs, context_lens, block_size, device):
-    # FIXME(Soo): Later, adjust to make it work for increasing KV cache size over iters
-    # We need to make the best use of memory footprint by key, value cache without
-    # idle space in the middle; still, it wouldn't matter much to performance
+def gen_block_table_and_slot_mapping(num_blocks, num_seqs, context_lens, block_size, device):
+    # We aim to make the best use of memory footprint by keeping key, value cache
+    # in a contiguous space; still, it wouldn't matter much to performance
     # since CUDA kernel reads each token at a time from physical address
     # by block_table anyway although consecutive ones would give better physical locality
+
+    # HACK(Soo): If KV cache size goes beyond available memory, we reuse existing KV cache for computation
     block_tables = []
     total_num_blocks = 0
     for i in range(num_seqs):
         max_num_blocks_per_seq = (context_lens[i] + block_size - 1) // block_size
         block_table = [
-            total_num_blocks + j
+            (total_num_blocks + j) % num_blocks # HACK(soo): % num_blocks is a hack to share KV cache when it overflows
             for j in range(max_num_blocks_per_seq)
         ]
         total_num_blocks += max_num_blocks_per_seq
@@ -76,9 +77,9 @@ def gen_block_table_and_slot_mapping(num_seqs, context_lens, block_size, device)
     return block_tables, None
 
 
-def gen_model_input_metadata(num_seqs, context_lens, max_context_len, block_size, device):
+def gen_model_input_metadata(num_blocks, num_seqs, context_lens, max_context_len, block_size, device):
     block_tables, slot_mapping = gen_block_table_and_slot_mapping(
-        num_seqs, context_lens, block_size, device)
+        num_blocks, num_seqs, context_lens, block_size, device)
 
     input_metadata = InputMetadata(
         is_prompt=False,
