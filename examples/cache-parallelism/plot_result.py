@@ -6,8 +6,10 @@ from matplotlib import ticker as mticker
 from matplotlib.ticker import FuncFormatter
 
 METHOD_STR = "Method"
-LATENCY_STR = "Normalized Latency"
-THROUGHPUT_STR = "Normalized Throughput"
+# LATENCY_STR = "Normalized Latency"
+# THROUGHPUT_STR = "Normalized Throughput"
+LATENCY_STR = "Latency (ms)"
+THROUGHPUT_STR = "Throughput (tokens / s)"
 def create_df_throughput_vs_seq_len(file_path, model_name, num_seqs):
     result_dic = json.load(open(file_path))
     result_dic = result_dic[model_name][num_seqs]
@@ -29,6 +31,8 @@ def get_throughput_vs_latency(file_path, model_name, seq_len):
     batch_sizes = list(result_dic[model_name].keys())
     batch_sizes = [int(bs) for bs in batch_sizes]
     batch_sizes.sort()
+    batch_sizes.remove(128)
+    batch_sizes.remove(256)
 
     plot_dic = {
         METHOD_STR: [],
@@ -38,12 +42,15 @@ def get_throughput_vs_latency(file_path, model_name, seq_len):
 
     for bs in batch_sizes:
         for method, (latency, throughput) in result_dic[model_name][str(bs)][seq_len].items():
-            plot_dic[METHOD_STR].append(method)
+            plot_dic[METHOD_STR].append(method.upper())
             plot_dic[LATENCY_STR].append(latency)
             plot_dic[THROUGHPUT_STR].append(throughput)
     max_latency, max_throughput = max(plot_dic[LATENCY_STR]), max(plot_dic[THROUGHPUT_STR])
-    plot_dic[LATENCY_STR] = [float(latency) / max_latency for latency in plot_dic[LATENCY_STR]]
-    plot_dic[THROUGHPUT_STR] = [float(tput) / max_throughput for tput in plot_dic[THROUGHPUT_STR]]
+    min_latency, min_throughput = min(plot_dic[LATENCY_STR]), min(plot_dic[THROUGHPUT_STR])
+    # plot_dic[LATENCY_STR] = [(float(latency) - min_latency) / (max_latency - min_latency) for latency in plot_dic[LATENCY_STR]]
+    # plot_dic[THROUGHPUT_STR] = [(float(tput) - min_throughput) / (max_throughput - min_throughput) for tput in plot_dic[THROUGHPUT_STR]]
+    plot_dic[LATENCY_STR] = [latency for latency in plot_dic[LATENCY_STR]]
+    plot_dic[THROUGHPUT_STR] = [tput for tput in plot_dic[THROUGHPUT_STR]]
     df = pd.DataFrame(plot_dic)
     print(df.to_string())
     return df
@@ -57,14 +64,21 @@ def draw_throughput_vs_seq_len_plot(df, out_file_path):
     # Handle the case where we have only two parallelisms
     markers = ['s', 'o', 'D'] if len(df.columns) == 3 else ['o', 'D']
     colors = ['C2', 'C1', 'C0'] if len(df.columns) == 3 else ['C1', 'C0']
-    ax = df.plot.line(figsize=(10, 7), markersize=15, color=colors)
-    for i, line in enumerate(ax.get_lines()):
-        line.set_marker(markers[i])
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for col, marker, color in zip(df.columns, markers, colors):
+        ax.plot(df.index, df[col], markersize=15, linestyle='-', marker=marker, color=color, label=col)
+
+    # Show legend
+    ax.legend()
+
+    # ax = df.plot.line(figsize=(10, 7), markersize=15, color=colors)
+    # for i, line in enumerate(ax.get_lines()):
+    #     line.set_marker(markers[i])
 
 
     plt.xticks(rotation=0)
     plt.xlabel("Sequence Length")
-    plt.ylabel('Throughput')# (Tokens / Sec)')
+    plt.ylabel('Throughput (tokens / s)')# (Tokens / Sec)')
     formatter = FuncFormatter(to_k)
     plt.gca().yaxis.set_major_formatter(formatter)
     plt.gca().xaxis.set_major_formatter(formatter)
@@ -123,7 +137,7 @@ if __name__ == "__main__":
         df = create_df_throughput_vs_seq_len(result_path, model_name, str(num_seq))
         draw_throughput_vs_seq_len_plot(df, out_file_path)
 
-    seq_lens = [1000, 10000, 100000]
+    seq_lens = [10000, 50000, 100000]
     result_path = "/home/byungsoj/eval_results/result.json"
     model_name = "Llama-7B"
     for seq_len in seq_lens:

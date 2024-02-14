@@ -311,7 +311,8 @@ if __name__ == "__main__":
     # num_seqs_arr = [16, 128, 1024]
 
     # Setting for throughput vs. latency
-    max_kv_cache_context_lens = [1000, 10000, 100000]
+    # max_kv_cache_context_lens = [1000, 10000, 100000]
+    max_kv_cache_context_lens = [50000]
     num_seqs_arr = [16, 32, 64, 128, 256, 512, 1024]
 
     for n_seqs in num_seqs_arr:
