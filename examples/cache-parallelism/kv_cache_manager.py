@@ -86,9 +86,12 @@ class BatchManager:
         self.target_gen_iters = []
 
         # Initialize wait queue
+        # FIXME(Soo): I don't understand why seq_lens should be torch.tensor to remove ValueError for self.running_queue(seq)
         for idx, (sl, tsl) in enumerate(zip(seq_lens, target_seq_lens)):
-            self.wait_queue.add(Sequence(idx, sl, tsl))
+            self.wait_queue.add(Sequence(idx, sl.cpu(), tsl))
             self.target_gen_iters.append(tsl - sl.cpu().item())
+
+        # print("Target gen iters: ", self.target_gen_iters)
 
         self.load_seqs_to_gpu()
 
@@ -104,7 +107,7 @@ class BatchManager:
                     self.running_queue.remove(seq)
                     self.kv_cache_manager.discard_seq(seq)
             else:
-                if seq.cur_len >= seq.target_len:
+                if seq.cur_len + 1 >= seq.target_len:
                     self.running_queue.remove(seq)
                     self.kv_cache_manager.discard_seq(seq)
 
@@ -116,7 +119,8 @@ class BatchManager:
 
     def add_new_tokens(self, iter_id):
         for seq in self.running_queue:
-            cp_special_cond = self.cfg.p_type == "cp" and self.rank == (iter_id % self.cfg.n_gpus)
+            # HACK(Soo): Prevent discrepancy in sequence length across GPUs that causes illegal memory access
+            cp_special_cond = self.cfg.p_type == "cp" and iter_id % self.cfg.n_gpus == 0
             if self.cfg.p_type != "cp" or cp_special_cond:
                 seq.cur_len += 1
                 while not self.kv_cache_manager.add_new_token():
@@ -128,36 +132,53 @@ class BatchManager:
                 self.running_queue.add(seq)
                 self.wait_queue.remove(seq)
 
+        assert self.running_queue or not self.wait_queue, "OOM"
+
     def update(self, iter_id):
         # Operations from current model execution
         self.discard_completed_seqs(iter_id)
         self.add_new_tokens(iter_id)
         self.load_seqs_to_gpu()
 
+    def get_input_num_seqs(self):
+        # HACK(Soo): Create redundant input to prevent illegal memory access from all_gather for CP case
+        kv_cache_num_seqs = len(self.running_queue)
+        input_num_seqs = (kv_cache_num_seqs + self.cfg.n_gpus - 1) // self.cfg.n_gpus if self.cfg.p_type == "cp" else kv_cache_num_seqs
+
+        return input_num_seqs
     def gen_hidden_states(self, scale):
         decode_context_len = 1
 
         kv_cache_num_seqs = len(self.running_queue)
-        input_num_seqs = kv_cache_num_seqs // self.cfg.n_gpus if self.cfg.p_type == "cp" else kv_cache_num_seqs
-        if self.cfg.p_type == "cp" and self.rank < (kv_cache_num_seqs % self.cfg.n_gpus):
-            input_num_seqs += 1
-
+        input_num_seqs = self.get_input_num_seqs()
         hidden_states = torch.empty(input_num_seqs, decode_context_len, self.hidden_size,
                                     dtype=self.cfg.dtype, device=self.device)
         hidden_states.uniform_(-scale, scale)
+
+        # HACK(Soo): Make redundant input to zero vector for CP case
+        if kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
+            hidden_states[kv_cache_num_seqs:,:,:] = 0
 
         return hidden_states
 
     def gen_input_metadata(self):
         cur_block_tables = []
-        tmp_running_queue = list(copy.deepcopy(self.running_queue))
         context_lens = []
         max_context_len = 0
-        for seq in tmp_running_queue:
+
+        input_num_seqs = self.get_input_num_seqs()
+        kv_cache_num_seqs = len(self.running_queue)
+        for seq in self.running_queue:
             cur_block_tables.append(self.imaginary_all_block_tables[seq.idx])
             context_lens.append(seq.cur_len)
             if max_context_len < seq.cur_len:
                 max_context_len = seq.cur_len
+
+        # HACK(Soo): Create redundant input to prevent illegal memory access from all_gather for CP case
+        while kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
+            context_lens.append(1)
+            cur_block_tables.append(self.imaginary_all_block_tables[0])
+            kv_cache_num_seqs += 1
 
         context_lens = torch.tensor(context_lens, dtype=torch.int, device=self.device)
         cur_block_tables = torch.tensor(cur_block_tables, dtype=torch.int, device=self.device)

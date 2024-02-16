@@ -123,7 +123,7 @@ def init_context_lens(
         if i >= n_long_seqs:
             start_len = min_kv_cache_context_len
             end_len = min(2 * min_kv_cache_context_len, max_kv_cache_context_len)
-            context_lens[i] = random.randint(start_len, end_len)
+            context_lens[i] = (random.randint(start_len, end_len) // n_gpus) * n_gpus
         n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
         target_context_lens[i] = context_lens[i] + n_decode_iters
 
@@ -214,6 +214,8 @@ def run_local_model(
         kv_caches = kv_caches[0]
 
     # TODO(Soo): Increase KV cache size over iterations
+    # print("con len: ", context_lens)
+    # print("target con len: ", target_context_lens)
     arr_elapsed_time_ms = []
     for _ in range(cfg.n_warmup_iters + cfg.n_eval_iters):
         # Initialize batch manager
@@ -222,8 +224,8 @@ def run_local_model(
         # Measure time
         # Creating start and end events
         start_time = time.perf_counter()
-        iter_id = 0
-        print("size of queue r, s: ", len(batch_manager.running_queue), len(batch_manager.wait_queue))
+        iter_id = 1
+        # print("size of queue r, s: ", len(batch_manager.running_queue), len(batch_manager.wait_queue))
         while batch_manager.is_running():
             hidden_states = batch_manager.gen_hidden_states(scale)
 
@@ -251,8 +253,8 @@ def run_local_model(
     avg_elapsed_time_ms = np.mean(arr_elapsed_time_ms)
     # if rank == 0:
     #     print(f"[{cfg.p_type}] Avg Elapsed time ({rank}): {avg_elapsed_time_ms:.3f} ms")
-    print("Time array: ", arr_elapsed_time_ms)
-    print("# tokens : ", n_total_tokens)
+    # print("Time array: ", arr_elapsed_time_ms)
+    # print("# tokens : ", n_total_tokens)
 
     return avg_elapsed_time_ms, n_total_tokens
 
@@ -315,7 +317,7 @@ if __name__ == "__main__":
     # Evaluation config
     eval_cfg = EvaluationConfig(
         # Evaluation configs
-        n_gpus = 2,
+        n_gpus = 4,
         n_eval_iters = 10,
         n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
@@ -354,7 +356,7 @@ if __name__ == "__main__":
     # num_seqs_arr = [16, 128, 1024]
 
     # debug
-    max_kv_cache_context_lens = [10000]
+    max_kv_cache_context_lens = [1000]
     num_seqs_arr = [16]
 
     # Setting for throughput vs. latency
