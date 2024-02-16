@@ -63,33 +63,33 @@ def gen_block_table_and_slot_mapping(num_blocks, num_seqs, context_lens, block_s
     # HACK(Soo): If KV cache size goes beyond available memory, we reuse existing KV cache for computation
     block_tables = []
     total_num_blocks = 0
+    max_len = max(context_lens) # Need to make torch.tensor shape
     for i in range(num_seqs):
-        max_num_blocks_per_seq = (context_lens[i] + block_size - 1) // block_size
+        max_num_blocks_per_seq = (max_len + block_size - 1) // block_size
         block_table = [
             (total_num_blocks + j) % num_blocks # HACK(soo): % num_blocks is a hack to share KV cache when it overflows
             for j in range(max_num_blocks_per_seq)
         ]
         total_num_blocks += max_num_blocks_per_seq
         block_tables.append(block_table)
-    block_tables = torch.tensor(block_tables, dtype=torch.int, device=device)
+
+    # block_tables = torch.tensor(block_tables, dtype=torch.int, device=device)
 
     # FIXME(Soo): Enable slot_mapping if needed later
     return block_tables, None
 
 
-def gen_model_input_metadata(num_blocks, num_seqs, context_lens, max_context_len, block_size, device):
-    block_tables, slot_mapping = gen_block_table_and_slot_mapping(
-        num_blocks, num_seqs, context_lens, block_size, device)
-
-    input_metadata = InputMetadata(
-        is_prompt=False,
-        slot_mapping=slot_mapping,
-        max_context_len=max_context_len,
-        context_lens=context_lens,
-        block_tables=block_tables,
-        use_cuda_graph=False,
-    )
-
-    return input_metadata
-
-
+# def gen_model_input_metadata(num_blocks, num_seqs, context_lens, max_context_len, block_size, device):
+#     block_tables, slot_mapping = gen_block_table_and_slot_mapping(
+#         num_blocks, num_seqs, context_lens, block_size, device)
+#
+#     input_metadata = InputMetadata(
+#         is_prompt=False,
+#         slot_mapping=slot_mapping,
+#         max_context_len=max_context_len,
+#         context_lens=context_lens,
+#         block_tables=block_tables,
+#         use_cuda_graph=False,
+#     )
+#
+#     return input_metadata

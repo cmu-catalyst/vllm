@@ -1,7 +1,9 @@
 import copy
 import os
+import time
 import torch
 import numpy as np
+import random
 from typing import Any, Dict, List, Tuple
 
 from transformers import LlamaConfig
@@ -9,9 +11,9 @@ from llama_llm import LlamaModel
 from cache_parallel_llm import CacheParallelDecodeLlamaAttention, CacheParallelDecodeLlamaLayer
 from data_parallel_llm import DataParallelDecodeLlamaAttention, DataParallelDecodeLlamaLayer
 from tensor_parallel_llm import TensorParallelDecodeLlamaAttention, TensorParallelDecodeLlamaLayer
-from synthetic_data_utils import gen_random_kv_cache, gen_model_input_metadata
+from synthetic_data_utils import gen_random_kv_cache
 from eval_logger import EvaluationLogger, EvaluationConfig
-
+from kv_cache_manager import BatchManager
 
 def get_model_by_parallelism_type(
         p_type: str,
@@ -75,17 +77,20 @@ def get_attn_by_parallelism_type(
 def adjust_configs_by_parallelism_type(
         cfg: EvaluationConfig,
         context_lens: List[int],
+        target_context_lens: List[int],
         rank: int,
 ):
     p_type = cfg.p_type
     if p_type == "cp":
         context_lens = context_lens // cfg.n_gpus
+        target_context_lens = [i // cfg.n_gpus for i in target_context_lens]
     elif p_type == "dp":
-        cfg.num_seqs = cfg.num_seqs // cfg.n_gpus
+        num_seqs_per_gpu = cfg.num_seqs // cfg.n_gpus
 
-        start_idx = rank * cfg.num_seqs
-        end_idx = rank * cfg.num_seqs + cfg.num_seqs
+        start_idx = rank * num_seqs_per_gpu
+        end_idx = rank * num_seqs_per_gpu + num_seqs_per_gpu
         context_lens = context_lens[start_idx:end_idx]
+        target_context_lens = target_context_lens[start_idx:end_idx]
     elif p_type == "tp":
         pass
     else:
@@ -96,7 +101,38 @@ def adjust_configs_by_parallelism_type(
     # tp_divisor = cfg.n_gpus if p_type == "tp" else 1
     # assert total_tokens / tp_divisor <= cfg.num_blocks * cfg.block_size, "KV cache OOM"
 
-    return cfg, context_lens
+    return cfg, context_lens, target_context_lens
+
+def init_context_lens(
+        max_kv_cache_context_len: int,
+        num_seqs: int,
+        n_gpus: int,
+        device: torch.device,
+        long_seq_ratio: float = 0.2,
+        min_seq_len_multiplier: float = 0.1,
+        min_seq_len: int = 10,
+        n_min_decode_iters: int = 10,
+        n_max_decode_iters: int = 100,
+):
+    min_kv_cache_context_len = max(int(min_seq_len_multiplier * max_kv_cache_context_len), min_seq_len)
+    context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
+    target_context_lens = [0 for _ in range(num_seqs)]
+    n_long_seqs = int(num_seqs * long_seq_ratio)
+
+    for i, l in enumerate(context_lens):
+        if i >= n_long_seqs:
+            start_len = min_kv_cache_context_len
+            end_len = min(2 * min_kv_cache_context_len, max_kv_cache_context_len)
+            context_lens[i] = random.randint(start_len, end_len)
+        n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
+        target_context_lens[i] = context_lens[i] + n_decode_iters
+
+    # DEBUG(Soo): For debugging
+    # context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
+    # target_context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
+
+    return context_lens, target_context_lens
+
 
 @torch.inference_mode()
 def run_local_model(
@@ -106,13 +142,15 @@ def run_local_model(
     # Evaluation config
     torch.random.manual_seed(cfg.rand_seed)
     torch.cuda.manual_seed(cfg.rand_seed)
+    random.seed(cfg.rand_seed)
     device = torch.device(f"cuda:{rank}")
 
     # Input / Model configs
     # TODO(Soo): Test with varying KV cache context length
-    context_lens = [cfg.max_kv_cache_context_len for _ in range(cfg.num_seqs)]
+    context_lens, target_context_lens = init_context_lens(
+        cfg.max_kv_cache_context_len, cfg.num_seqs, cfg.n_gpus, device)
+    n_total_tokens = sum([t - c for (c, t) in zip(context_lens, target_context_lens)])
     context_lens = torch.tensor(context_lens, dtype=torch.int, device=device)
-    decode_context_len = 1
 
     # Load Llama-7B configurations for testing
     llama_cfg = cfg.llama_cfg
@@ -125,9 +163,10 @@ def run_local_model(
     rope_scaling = getattr(llama_cfg, "rope_scaling", None)
     max_position_embeddings = getattr(llama_cfg, "max_position_embeddings", 8192)
 
-    cfg, context_lens = adjust_configs_by_parallelism_type(
+    cfg, context_lens, target_context_lens = adjust_configs_by_parallelism_type(
         cfg=cfg,
         context_lens=context_lens,
+        target_context_lens=target_context_lens,
         rank=rank,
     )
     cfg.max_kv_cache_context_len = max(context_lens.cpu().numpy())
@@ -159,10 +198,6 @@ def run_local_model(
 
     # Initialize hidden states
     scale = float(1.0 / (head_size ** 0.5))
-    input_num_seqs = cfg.num_seqs // cfg.n_gpus if cfg.p_type == "cp" else cfg.num_seqs
-    hidden_states = torch.empty(input_num_seqs, decode_context_len, hidden_size,
-                                dtype=cfg.dtype, device=device)
-    hidden_states.uniform_(-scale, scale)
 
     kv_caches = gen_random_kv_cache(
         num_blocks=cfg.num_blocks,
@@ -177,41 +212,49 @@ def run_local_model(
     # Note(Soo): Hack
     if not isinstance(model, LlamaModel):
         kv_caches = kv_caches[0]
-    input_metadata = gen_model_input_metadata(
-        cfg.num_blocks,
-        cfg.num_seqs,
-        context_lens,
-        cfg.max_kv_cache_context_len,
-        cfg.block_size,
-        device
-    )
 
     # TODO(Soo): Increase KV cache size over iterations
     arr_elapsed_time_ms = []
     for _ in range(cfg.n_warmup_iters + cfg.n_eval_iters):
+        # Initialize batch manager
+        batch_manager = BatchManager(cfg, rank, device, hidden_size, context_lens, target_context_lens, kv_caches)
+
         # Measure time
         # Creating start and end events
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
+        start_time = time.perf_counter()
+        iter_id = 0
+        print("size of queue r, s: ", len(batch_manager.running_queue), len(batch_manager.wait_queue))
+        while batch_manager.is_running():
+            hidden_states = batch_manager.gen_hidden_states(scale)
 
-        output = model(hidden_states, kv_caches, input_metadata)
+            # We need to adjust InputMetadata every iter
+            input_metadata = batch_manager.gen_input_metadata()
 
-        end_event.record()
+            output = model(hidden_states, kv_caches, input_metadata)
+
+            batch_manager.update(iter_id)
+            # if rank == 0:
+            #     print(f"Iter {iter_id}: {len(batch_manager.wait_queue)}, {len(batch_manager.running_queue)}")
+            iter_id += 1
+
         torch.cuda.synchronize()
+        # torch.distributed.barrier()
+
+        end_time = time.perf_counter()
 
         # Calculating elapsed time
-        elapsed_time_ms = start_event.elapsed_time(end_event)
+        elapsed_time_ms = (end_time - start_time) * 1000
         arr_elapsed_time_ms.append(elapsed_time_ms)
-        # print(f"Rank: {rank} / {world_size} done - output shape: {output.shape}")
         # print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
 
     arr_elapsed_time_ms = arr_elapsed_time_ms[cfg.n_warmup_iters:]
     avg_elapsed_time_ms = np.mean(arr_elapsed_time_ms)
-    if rank == 0:
-        print(f"[{cfg.p_type}] Avg Elapsed time ({rank}): {avg_elapsed_time_ms:.3f} ms")
+    # if rank == 0:
+    #     print(f"[{cfg.p_type}] Avg Elapsed time ({rank}): {avg_elapsed_time_ms:.3f} ms")
+    print("Time array: ", arr_elapsed_time_ms)
+    print("# tokens : ", n_total_tokens)
 
-    return avg_elapsed_time_ms
+    return avg_elapsed_time_ms, n_total_tokens
 
 def save_result_to_file(
         cfg: EvaluationConfig,
@@ -245,15 +288,14 @@ def run_distributed_model(
     init_cfg = copy.deepcopy(eval_cfg)
 
     # Run models
-    avg_latency_ms = run_local_model(rank, eval_cfg)
-    n_tokens_per_sec = init_cfg.num_seqs / (avg_latency_ms / 1000.0)
+    avg_latency_ms, n_total_tokens = run_local_model(rank, eval_cfg)
+    n_tokens_per_sec = n_total_tokens  / (avg_latency_ms / 1000.0)
 
     # Log results
-    if rank == 0:
-        # Use init_cfg instead of eval_cfg since eval_cfg will change
-        # depending on parallelism type
-        # save_result_to_file(init_cfg, avg_latency_ms)
-        save_result_to_file(init_cfg, (avg_latency_ms, n_tokens_per_sec))
+    # Use init_cfg instead of eval_cfg since eval_cfg will change
+    # depending on parallelism type
+    # NOTE(Soo): Save only the latnecy of critical path among all ranks inside this function.
+    save_result_to_file(init_cfg, (avg_latency_ms, n_tokens_per_sec))
 
     # Clean up
     torch.distributed.destroy_process_group()
@@ -273,9 +315,9 @@ if __name__ == "__main__":
     # Evaluation config
     eval_cfg = EvaluationConfig(
         # Evaluation configs
-        n_gpus = 4,
-        n_eval_iters = 20,
-        n_warmup_iters = 10,
+        n_gpus = 2,
+        n_eval_iters = 10,
+        n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
         rand_seed = 0,
         p_type="cp",
@@ -295,7 +337,8 @@ if __name__ == "__main__":
         # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster, 16 seqs); should be 80000 with bs of 1024
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
         # num_blocks = 1000,
-        num_blocks = 80000,
+        # num_blocks = 80000,
+        num_blocks = 10000,
         block_size = 16,
         partition_size = 512,
     )
@@ -310,10 +353,14 @@ if __name__ == "__main__":
     # max_kv_cache_context_lens = [i for i in range(10000, 100001, 10000)]
     # num_seqs_arr = [16, 128, 1024]
 
+    # debug
+    max_kv_cache_context_lens = [10000]
+    num_seqs_arr = [16]
+
     # Setting for throughput vs. latency
     # max_kv_cache_context_lens = [1000, 10000, 100000]
-    max_kv_cache_context_lens = [50000]
-    num_seqs_arr = [16, 32, 64, 128, 256, 512, 1024]
+    # max_kv_cache_context_lens = [50000]
+    # num_seqs_arr = [16, 32, 64, 128, 256, 512, 1024]
 
     for n_seqs in num_seqs_arr:
         for cache_len in max_kv_cache_context_lens:

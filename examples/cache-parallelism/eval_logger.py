@@ -75,7 +75,14 @@ class EvaluationLogger:
         if seq_len not in self.results[model][batch_size]:
             self.results[model][batch_size][seq_len] = {}
 
-        self.results[model][batch_size][seq_len][p_type] = (round(avg_latency_ms, 3), int(n_tokens_per_sec))
+        if p_type in self.results[model][batch_size][seq_len]:
+            # HACK(Soo): Save only the critical path latency / throughput among all ranks
+            saved_latency = self.results[model][batch_size][seq_len][p_type][0]
+            if avg_latency_ms > saved_latency:
+                self.results[model][batch_size][seq_len][p_type] = (round(avg_latency_ms, 3), int(n_tokens_per_sec))
+        else:
+            self.results[model][batch_size][seq_len][p_type] = (round(avg_latency_ms, 3), int(n_tokens_per_sec))
+
         self.results[model][batch_size][seq_len] = dict(sorted(self.results[model][batch_size][seq_len].items()))
 
     def save_results(self):
