@@ -225,11 +225,8 @@ def run_local_model(
         # Creating start and end events
         start_time = time.perf_counter()
         iter_id = 1
-        # print("size of queue r, s: ", len(batch_manager.running_queue), len(batch_manager.wait_queue))
         while batch_manager.is_running():
             hidden_states = batch_manager.gen_hidden_states(scale)
-
-            # We need to adjust InputMetadata every iter
             input_metadata = batch_manager.gen_input_metadata()
 
             output = model(hidden_states, kv_caches, input_metadata)
@@ -238,16 +235,18 @@ def run_local_model(
             # if rank == 0:
             #     print(f"Iter {iter_id}: {len(batch_manager.wait_queue)}, {len(batch_manager.running_queue)}")
             iter_id += 1
+            # NOTE(Soo): If it's not in while loop, it will cause race condition for CP;
+            # I couldn't understand the detail though.
+            torch.cuda.synchronize()
 
-        torch.cuda.synchronize()
         # torch.distributed.barrier()
-
         end_time = time.perf_counter()
 
         # Calculating elapsed time
         elapsed_time_ms = (end_time - start_time) * 1000
         arr_elapsed_time_ms.append(elapsed_time_ms)
-        # print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
+        # if rank == 0:
+        #     print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
 
     arr_elapsed_time_ms = arr_elapsed_time_ms[cfg.n_warmup_iters:]
     avg_elapsed_time_ms = np.mean(arr_elapsed_time_ms)
@@ -297,7 +296,16 @@ def run_distributed_model(
     # Use init_cfg instead of eval_cfg since eval_cfg will change
     # depending on parallelism type
     # NOTE(Soo): Save only the latnecy of critical path among all ranks inside this function.
-    save_result_to_file(init_cfg, (avg_latency_ms, n_tokens_per_sec))
+    result = torch.tensor([avg_latency_ms, n_tokens_per_sec], device=torch.device(f"cuda:{rank}"))
+    result_list = [torch.empty_like(result) for _ in range(eval_cfg.n_gpus)]
+    torch.distributed.all_gather(result_list, result)
+    if rank == 0:
+        avg_latency_ms, n_tokens_per_sec = -1, -1
+        for result in result_list:
+            if avg_latency_ms < result[0]:
+                avg_latency_ms = result[0].cpu().item()
+                n_tokens_per_sec = result[1].cpu().item()
+        save_result_to_file(init_cfg, (avg_latency_ms, n_tokens_per_sec))
 
     # Clean up
     torch.distributed.destroy_process_group()
@@ -340,7 +348,7 @@ if __name__ == "__main__":
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
         # num_blocks = 1000,
         # num_blocks = 80000,
-        num_blocks = 10000,
+        num_blocks = 2000,
         block_size = 16,
         partition_size = 512,
     )
@@ -349,6 +357,7 @@ if __name__ == "__main__":
     # p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
+    # p_types = ["dp", "tp"]
 
     # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
     # Setting for throughput vs. sequence length

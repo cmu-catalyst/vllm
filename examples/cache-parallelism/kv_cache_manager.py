@@ -101,15 +101,17 @@ class BatchManager:
     def discard_completed_seqs(self, iter_id):
         tmp_running_queue = copy.deepcopy(self.running_queue)
         for seq in tmp_running_queue:
-            if self.cfg.p_type == "cp":
-                # HACK(Soo): Discard based on iter_id with assumption that generation length is always multiple of n_gpus
-                if self.target_gen_iters[seq.idx] == iter_id:
-                    self.running_queue.remove(seq)
-                    self.kv_cache_manager.discard_seq(seq)
-            else:
-                if seq.cur_len + 1 >= seq.target_len:
-                    self.running_queue.remove(seq)
-                    self.kv_cache_manager.discard_seq(seq)
+            # if self.cfg.p_type == "cp":
+            #     # HACK(Soo): Discard based on iter_id with assumption that generation length is always multiple of n_gpus
+            #     if self.target_gen_iters[seq.idx] * self.cfg.n_gpus == iter_id:
+            #         self.running_queue.remove(seq)
+            #         self.kv_cache_manager.discard_seq(seq)
+            # else:
+
+            # HACK(Soo): This code is simpler, but gives CP (n_gpus - 1) less iterations / seq (it's minor though)
+            if seq.cur_len + 1 >= seq.target_len:
+                self.running_queue.remove(seq)
+                self.kv_cache_manager.discard_seq(seq)
 
     def evict_seq_to_cpu_and_put_it_on_hold(self):
         seq = self.running_queue.pop(0)
@@ -120,7 +122,7 @@ class BatchManager:
     def add_new_tokens(self, iter_id):
         for seq in self.running_queue:
             # HACK(Soo): Prevent discrepancy in sequence length across GPUs that causes illegal memory access
-            cp_special_cond = self.cfg.p_type == "cp" and iter_id % self.cfg.n_gpus == 0
+            cp_special_cond = iter_id % self.cfg.n_gpus == 0
             if self.cfg.p_type != "cp" or cp_special_cond:
                 seq.cur_len += 1
                 while not self.kv_cache_manager.add_new_token():
@@ -146,18 +148,17 @@ class BatchManager:
         input_num_seqs = (kv_cache_num_seqs + self.cfg.n_gpus - 1) // self.cfg.n_gpus if self.cfg.p_type == "cp" else kv_cache_num_seqs
 
         return input_num_seqs
+
     def gen_hidden_states(self, scale):
         decode_context_len = 1
 
-        kv_cache_num_seqs = len(self.running_queue)
         input_num_seqs = self.get_input_num_seqs()
         hidden_states = torch.empty(input_num_seqs, decode_context_len, self.hidden_size,
                                     dtype=self.cfg.dtype, device=self.device)
         hidden_states.uniform_(-scale, scale)
 
-        # HACK(Soo): Make redundant input to zero vector for CP case
-        if kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
-            hidden_states[kv_cache_num_seqs:,:,:] = 0
+        # TODO(Soo): Make redundant input to zero vector for CP case?
+        # print(f"hidden shape (rank {self.rank}): ", hidden_states.shape)
 
         return hidden_states
 
@@ -175,13 +176,18 @@ class BatchManager:
                 max_context_len = seq.cur_len
 
         # HACK(Soo): Create redundant input to prevent illegal memory access from all_gather for CP case
-        while kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
+        while self.cfg.p_type == "cp" and kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
             context_lens.append(1)
             cur_block_tables.append(self.imaginary_all_block_tables[0])
             kv_cache_num_seqs += 1
 
+        # print(f"conlen shape (rank {self.rank}): ", len(context_lens))
+        # print(f"bt shape (rank {self.rank}): ", len(cur_block_tables))
         context_lens = torch.tensor(context_lens, dtype=torch.int, device=self.device)
         cur_block_tables = torch.tensor(cur_block_tables, dtype=torch.int, device=self.device)
+
+        # print(f"conlen shape (rank {self.rank}): ", context_lens.shape)
+        # print(f"bt shape (rank {self.rank}): ", cur_block_tables.shape)
 
         input_metadata = InputMetadata(
             is_prompt=False,
