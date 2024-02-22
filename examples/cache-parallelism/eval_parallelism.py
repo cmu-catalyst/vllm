@@ -129,7 +129,7 @@ def init_context_lens(
 
     # DEBUG(Soo): For debugging
     # context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
-    # target_context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
+    # target_context_lens = [max_kv_cache_context_len + 50 for _ in range(num_seqs)]
 
     return context_lens, target_context_lens
 
@@ -239,8 +239,10 @@ def run_local_model(
             # I couldn't understand the detail though.
             torch.cuda.synchronize()
 
-        # torch.distributed.barrier()
+        torch.distributed.barrier()
         end_time = time.perf_counter()
+        # print(rank, cfg.p_type, batch_manager.n_add_seqs)
+
 
         # Calculating elapsed time
         elapsed_time_ms = (end_time - start_time) * 1000
@@ -326,7 +328,7 @@ if __name__ == "__main__":
     eval_cfg = EvaluationConfig(
         # Evaluation configs
         n_gpus = 4,
-        n_eval_iters = 10,
+        n_eval_iters = 5,
         n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
         rand_seed = 0,
@@ -348,7 +350,7 @@ if __name__ == "__main__":
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
         # num_blocks = 1000,
         # num_blocks = 80000,
-        num_blocks = 2000,
+        num_blocks = 10000,
         block_size = 16,
         partition_size = 512,
     )
@@ -365,8 +367,8 @@ if __name__ == "__main__":
     # num_seqs_arr = [16, 128, 1024]
 
     # debug
-    max_kv_cache_context_lens = [1000]
-    num_seqs_arr = [16]
+    max_kv_cache_context_lens = [10000]
+    num_seqs_arr = [64]
 
     # Setting for throughput vs. latency
     # max_kv_cache_context_lens = [1000, 10000, 100000]
