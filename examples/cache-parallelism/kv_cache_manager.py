@@ -25,7 +25,7 @@ class Sequence:
         return hash(self.idx)
 
 class KVCacheManager:
-    def __init__(self, cfg, hidden_size, device, kv_caches):
+    def __init__(self, cfg, hidden_size, device, kv_caches, cpu_kv_caches):
         # HACK(Soo): Assume KV cache for single layer
         self.cfg = cfg
         self.hidden_size = hidden_size
@@ -35,11 +35,8 @@ class KVCacheManager:
         # For cache swap btw CPU and GPU
         self.gpu_key_cache = kv_caches[0] # (# blocks, # heads, head size // x, block size, x)
         self.gpu_value_cache = kv_caches[1] # (# blocks, # heads, head size, block size)
-
-        self.cpu_key_cache =  torch.empty(self.gpu_key_cache.shape, dtype=self.cfg.dtype, device='cpu', pin_memory=True)
-        self.cpu_value_cache = torch.empty(self.gpu_value_cache.shape, dtype=self.cfg.dtype, device='cpu', pin_memory=True)
-        self.cpu_key_cache.uniform_(-1, 1)
-        self.cpu_value_cache.uniform_(-1, 1)
+        self.cpu_key_cache = cpu_kv_caches[0]
+        self.cpu_value_cache = cpu_kv_caches[1]
 
         self.avail_gpu_cache_space = cfg.num_blocks * cfg.block_size # # of tokens to store
         if cfg.p_type == "tp":
@@ -87,7 +84,7 @@ class KVCacheManager:
 
 
 class BatchManager:
-    def __init__(self, cfg, rank, device, hidden_size, seq_lens, target_seq_lens, kv_caches):
+    def __init__(self, cfg, rank, device, hidden_size, seq_lens, target_seq_lens, kv_caches, cpu_kv_caches):
         self.cfg = cfg
         self.rank = rank
         self.device = device
@@ -100,7 +97,7 @@ class BatchManager:
         # HACK(Soo): We secure block for target_seq_len in advance to make implementation easier
         self.imaginary_all_block_tables, _ = gen_block_table_and_slot_mapping(
             cfg.num_blocks, len(target_seq_lens), target_seq_lens, cfg.block_size, device)
-        self.kv_cache_manager = KVCacheManager(cfg, hidden_size, device, kv_caches)
+        self.kv_cache_manager = KVCacheManager(cfg, hidden_size, device, kv_caches, cpu_kv_caches)
         self.target_gen_iters = []
 
         # Initialize wait queue

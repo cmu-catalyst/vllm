@@ -216,9 +216,17 @@ def run_local_model(
         seed=cfg.rand_seed,
         device=device,
     )
+
     # Note(Soo): Hack
     if not isinstance(model, LlamaModel):
         kv_caches = kv_caches[0]
+
+    # Generate CPU KV cache
+    cpu_key_cache = torch.empty(kv_caches[0].shape, dtype=cfg.dtype, device='cpu', pin_memory=True)
+    cpu_value_cache = torch.empty(kv_caches[1].shape, dtype=cfg.dtype, device='cpu', pin_memory=True)
+    cpu_key_cache.uniform_(-1, 1)
+    cpu_value_cache.uniform_(-1, 1)
+    cpu_kv_caches = (cpu_key_cache, cpu_value_cache)
 
     # TODO(Soo): Increase KV cache size over iterations
     # print("con len: ", context_lens)
@@ -226,7 +234,8 @@ def run_local_model(
     arr_elapsed_time_ms = []
     for _ in range(cfg.n_warmup_iters + cfg.n_eval_iters):
         # Initialize batch manager
-        batch_manager = BatchManager(cfg, rank, device, hidden_size, context_lens, target_context_lens, kv_caches)
+        batch_manager = BatchManager(
+            cfg, rank, device, hidden_size, context_lens, target_context_lens, kv_caches, cpu_kv_caches)
 
         # Measure time
         # Creating start and end events
@@ -255,7 +264,7 @@ def run_local_model(
         elapsed_time_ms = (end_time - start_time) * 1000
         arr_elapsed_time_ms.append(elapsed_time_ms)
         # if rank == 0:
-        #     print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
+        print(f"Elapsed time ({rank}): {elapsed_time_ms} ms")
 
     arr_elapsed_time_ms = arr_elapsed_time_ms[cfg.n_warmup_iters:]
     avg_elapsed_time_ms = np.mean(arr_elapsed_time_ms)
@@ -335,7 +344,7 @@ if __name__ == "__main__":
     eval_cfg = EvaluationConfig(
         # Evaluation configs
         n_gpus = 4,
-        n_eval_iters = 10,
+        n_eval_iters = 5,
         n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
         rand_seed = 0,
@@ -356,8 +365,8 @@ if __name__ == "__main__":
         # Note(Soo): 90000 is max # of blocks (1 attn in Catalyst cluster, 16 seqs); should be 80000 with bs of 1024
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
         # num_blocks = 1000,
-        # num_blocks = 80000,
-        num_blocks = 10000,
+        num_blocks = 80000,
+        # num_blocks = 10000, # Debug
         block_size = 16,
         partition_size = 512,
     )
