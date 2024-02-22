@@ -35,12 +35,6 @@ class KVCacheManager:
     def add_seq(self, seq):
         if self.avail_gpu_cache_space >= seq.cur_len:
             self.avail_gpu_cache_space -= seq.cur_len
-
-            # HACK(Soo): Only to measure CPU transfer time
-            tmp_data_cpu = torch.empty(2, seq.cur_len, self.hidden_size, dtype=self.cfg.dtype, device='cpu')
-            tmp_data_cpu.uniform_(-1, 1)
-            tmp_data_gpu = tmp_data_cpu.to(self.device)
-            tmp_data_gpu = tmp_data_gpu + 1  # Dummy compute to prevent lazy transfer
         else:
             return False
 
@@ -50,7 +44,9 @@ class KVCacheManager:
         self.avail_gpu_cache_space += seq.cur_len
 
         # HACK(Soo): Only to measure CPU transfer time
-        tmp_data_gpu = torch.empty(2, seq.cur_len, self.hidden_size, dtype=self.cfg.dtype, device=self.device)
+        # FIXME(Soo): Use pin memory to better simulate CPU transfer
+        tmp_hidden_size = self.hidden_size // self.cfg.n_gpus if self.cfg.p_type == "tp" else self.hidden_size
+        tmp_data_gpu = torch.empty(2, seq.cur_len, tmp_hidden_size, dtype=self.cfg.dtype, device=self.device)
         tmp_data_gpu.uniform_(-1, 1)
         tmp_data_cpu = tmp_data_gpu.cpu()
         tmp_data_cpu = tmp_data_cpu + 1 # Dummy compute to prevent lazy transfer
@@ -92,7 +88,8 @@ class BatchManager:
             self.target_gen_iters.append(tsl - sl.cpu().item())
 
         # print("Target gen iters: ", self.target_gen_iters)
-
+        # DEBUG
+        self.n_add_seqs = 0
         self.load_seqs_to_gpu()
 
     def is_running(self):
@@ -127,12 +124,26 @@ class BatchManager:
                 seq.cur_len += 1
                 while not self.kv_cache_manager.add_new_token():
                     self.evict_seq_to_cpu_and_put_it_on_hold()
+
     def load_seqs_to_gpu(self):
         tmp_wait_queue = copy.deepcopy(self.wait_queue)
+        tmp_total_seq_len = 0
         for seq in tmp_wait_queue:
             if self.kv_cache_manager.add_seq(seq):
+                self.n_add_seqs += 1
+                tmp_total_seq_len += seq.cur_len.cpu().item()
                 self.running_queue.add(seq)
                 self.wait_queue.remove(seq)
+
+        # HACK(Soo): Only to measure CPU transfer time
+        # FIXME(Soo): Use pin memory to better simulate CPU transfer
+        if tmp_total_seq_len > 0:
+            tmp_hidden_size = self.hidden_size // self.cfg.n_gpus if self.cfg.p_type == "tp" else self.hidden_size
+            tmp_data_cpu = torch.empty(2, tmp_total_seq_len, tmp_hidden_size, dtype=self.cfg.dtype, device='cpu')
+            tmp_data_cpu.uniform_(-1, 1)
+            tmp_data_gpu = tmp_data_cpu.to(self.device)
+            tmp_data_gpu = tmp_data_gpu + 1  # Dummy compute to prevent lazy transfer
+            # print("total data size to move: ", tmp_total_seq_len, "x", tmp_hidden_size)
 
         assert self.running_queue or not self.wait_queue, "OOM"
 
