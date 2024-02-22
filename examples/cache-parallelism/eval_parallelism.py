@@ -127,6 +127,13 @@ def init_context_lens(
         n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
         target_context_lens[i] = context_lens[i] + n_decode_iters
 
+    # Fair load balancing for DP (in case of long prefix case)
+    # num_seqs_per_gpu = num_seqs // n_gpus
+    # for i in range(n_long_seqs):
+    #     new_idx = (i % n_gpus) * num_seqs_per_gpu + (i // n_gpus)
+    #     context_lens[i], context_lens[new_idx] = context_lens[new_idx], context_lens[i]
+    #     target_context_lens[i], target_context_lens[new_idx] = target_context_lens[new_idx], target_context_lens[i]
+
     # DEBUG(Soo): For debugging
     # context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
     # target_context_lens = [max_kv_cache_context_len + 50 for _ in range(num_seqs)]
@@ -328,7 +335,7 @@ if __name__ == "__main__":
     eval_cfg = EvaluationConfig(
         # Evaluation configs
         n_gpus = 4,
-        n_eval_iters = 5,
+        n_eval_iters = 10,
         n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
         rand_seed = 0,
@@ -363,8 +370,8 @@ if __name__ == "__main__":
 
     # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
     # Setting for throughput vs. sequence length
-    # max_kv_cache_context_lens = [i for i in range(10000, 100001, 10000)]
-    # num_seqs_arr = [16, 128, 1024]
+    # max_kv_cache_context_lens = [i for i in range(10000, 50001, 5000)]
+    # num_seqs_arr = [16] #, 128, 1024]
 
     # debug
     max_kv_cache_context_lens = [10000]

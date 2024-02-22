@@ -1,9 +1,13 @@
 import copy
 import torch
+from typing import Any, Dict, List, Tuple
 
 from sortedcontainers import SortedList
 from synthetic_data_utils import gen_block_table_and_slot_mapping
+
+from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
+from llama_llm import KVCache
 
 class Sequence:
     def __init__(self, idx, cur_len, target_len):
@@ -25,12 +29,31 @@ class KVCacheManager:
         # HACK(Soo): Assume KV cache for single layer
         self.cfg = cfg
         self.hidden_size = hidden_size
+        self.hidden_size_per_gpu = hidden_size // cfg.n_gpus if cfg.p_type == "tp" else hidden_size
         self.device = device
-        self.value_cache = kv_caches[1] # (# blocks, # heads, head size, block size)
+
+        # For cache swap btw CPU and GPU
+        self.gpu_key_cache = kv_caches[0] # (# blocks, # heads, head size // x, block size, x)
+        self.gpu_value_cache = kv_caches[1] # (# blocks, # heads, head size, block size)
+
+        self.cpu_key_cache =  torch.empty(self.gpu_key_cache.shape, dtype=self.cfg.dtype, device='cpu', pin_memory=True)
+        self.cpu_value_cache = torch.empty(self.gpu_value_cache.shape, dtype=self.cfg.dtype, device='cpu', pin_memory=True)
+        self.cpu_key_cache.uniform_(-1, 1)
+        self.cpu_value_cache.uniform_(-1, 1)
 
         self.avail_gpu_cache_space = cfg.num_blocks * cfg.block_size # # of tokens to store
         if cfg.p_type == "tp":
             self.avail_gpu_cache_space *= cfg.n_gpus
+        self.ref_total_gpu_cache_space = self.avail_gpu_cache_space
+
+
+    def swap_cpu_to_gpu(self, total_seq_len):
+        # HACK(Soo): Only to measure CPU transfer time
+        assert total_seq_len <= self.ref_total_gpu_cache_space
+        n_blocks = (total_seq_len + self.cfg.block_size - 1) // self.cfg.block_size
+        # Dummy compute to prevent no copy
+        self.gpu_key_cache[:n_blocks,:,:,:,:] = self.cpu_key_cache[:n_blocks,:,:,:,:] + 0.001
+        self.gpu_value_cache[:n_blocks, :, :, :] = self.cpu_value_cache[:n_blocks, :, :, :] + 0.001
 
     def add_seq(self, seq):
         if self.avail_gpu_cache_space >= seq.cur_len:
@@ -43,13 +66,12 @@ class KVCacheManager:
     def evict_seq_to_cpu(self, seq):
         self.avail_gpu_cache_space += seq.cur_len
 
+        print("[Eviciton] Please do sanicy check for eviction once for long generation regime!")
         # HACK(Soo): Only to measure CPU transfer time
-        # FIXME(Soo): Use pin memory to better simulate CPU transfer
-        tmp_hidden_size = self.hidden_size // self.cfg.n_gpus if self.cfg.p_type == "tp" else self.hidden_size
-        tmp_data_gpu = torch.empty(2, seq.cur_len, tmp_hidden_size, dtype=self.cfg.dtype, device=self.device)
-        tmp_data_gpu.uniform_(-1, 1)
-        tmp_data_cpu = tmp_data_gpu.cpu()
-        tmp_data_cpu = tmp_data_cpu + 1 # Dummy compute to prevent lazy transfer
+        n_blocks = (seq.cur_len + self.cfg.block_size - 1) // self.cfg.block_size
+        # Dummy compute to prevent no copy
+        self.cpu_key_cache[:n_blocks, :, :, :, :] = self.gpu_key_cache[:n_blocks, :, :, :, :] + 0.001
+        self.cpu_value_cache[:n_blocks, :, :, :] = self.gpu_value_cache[:n_blocks, :, :, :] + 0.001
 
     def discard_seq(self, seq):
         self.avail_gpu_cache_space += seq.cur_len
@@ -135,15 +157,9 @@ class BatchManager:
                 self.running_queue.add(seq)
                 self.wait_queue.remove(seq)
 
-        # HACK(Soo): Only to measure CPU transfer time
-        # FIXME(Soo): Use pin memory to better simulate CPU transfer
+        # TODO(Soo): Replace it with real KV cache swap logic
         if tmp_total_seq_len > 0:
-            tmp_hidden_size = self.hidden_size // self.cfg.n_gpus if self.cfg.p_type == "tp" else self.hidden_size
-            tmp_data_cpu = torch.empty(2, tmp_total_seq_len, tmp_hidden_size, dtype=self.cfg.dtype, device='cpu')
-            tmp_data_cpu.uniform_(-1, 1)
-            tmp_data_gpu = tmp_data_cpu.to(self.device)
-            tmp_data_gpu = tmp_data_gpu + 1  # Dummy compute to prevent lazy transfer
-            # print("total data size to move: ", tmp_total_seq_len, "x", tmp_hidden_size)
+            self.kv_cache_manager.swap_cpu_to_gpu(tmp_total_seq_len)
 
         assert self.running_queue or not self.wait_queue, "OOM"
 
