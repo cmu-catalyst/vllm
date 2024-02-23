@@ -2,7 +2,6 @@ import copy
 import torch
 from typing import Any, Dict, List, Tuple
 
-from sortedcontainers import SortedList
 from synthetic_data_utils import gen_block_table_and_slot_mapping
 
 from vllm._C import cache_ops
@@ -23,6 +22,9 @@ class Sequence:
 
     def __hash__(self):
         return hash(self.idx)
+
+    def __repr__(self):
+        return str(self.idx)
 
 class KVCacheManager:
     def __init__(self, cfg, hidden_size, device, kv_caches, cpu_kv_caches):
@@ -63,7 +65,7 @@ class KVCacheManager:
     def evict_seq_to_cpu(self, seq):
         self.avail_gpu_cache_space += seq.cur_len
 
-        print("[Eviciton] Please do sanicy check for eviction once for long generation regime!")
+        # print("[Eviction] Please do sanicy check for eviction once for long generation regime!")
         # HACK(Soo): Only to measure CPU transfer time
         n_blocks = (seq.cur_len + self.cfg.block_size - 1) // self.cfg.block_size
         # Dummy compute to prevent no copy
@@ -90,8 +92,9 @@ class BatchManager:
         self.device = device
         self.hidden_size = hidden_size
 
-        self.running_queue = SortedList(key = lambda seq: seq.cur_len)
-        self.wait_queue = SortedList(key = lambda seq: -seq.cur_len)
+        # WARNING(SOO): Do not use SortedList! It does not use __eq__ in Sequence and cause errors!
+        self.running_queue = []
+        self.wait_queue = []
 
         # Initialize KV cache manager
         # HACK(Soo): We secure block for target_seq_len in advance to make implementation easier
@@ -103,7 +106,7 @@ class BatchManager:
         # Initialize wait queue
         # FIXME(Soo): I don't understand why seq_lens should be torch.tensor to remove ValueError for self.running_queue(seq)
         for idx, (sl, tsl) in enumerate(zip(seq_lens, target_seq_lens)):
-            self.wait_queue.add(Sequence(idx, sl.cpu(), tsl))
+            self.wait_queue.append(Sequence(idx, sl.cpu().item(), tsl))
             self.target_gen_iters.append(tsl - sl.cpu().item())
 
         # print("Target gen iters: ", self.target_gen_iters)
@@ -131,8 +134,9 @@ class BatchManager:
 
     def evict_seq_to_cpu_and_put_it_on_hold(self):
         seq = self.running_queue.pop(0)
+        # print("Seq ID to evict: ", seq.idx, "len: ", seq.cur_len, seq.target_len)
         self.kv_cache_manager.evict_seq_to_cpu(seq)
-        self.wait_queue.add(seq)
+        self.wait_queue.append(seq)
 
 
     def add_new_tokens(self, iter_id):
@@ -150,8 +154,8 @@ class BatchManager:
         for seq in tmp_wait_queue:
             if self.kv_cache_manager.add_seq(seq):
                 self.n_add_seqs += 1
-                tmp_total_seq_len += seq.cur_len.cpu().item()
-                self.running_queue.add(seq)
+                tmp_total_seq_len += seq.cur_len
+                self.running_queue.append(seq)
                 self.wait_queue.remove(seq)
 
         # TODO(Soo): Replace it with real KV cache swap logic
@@ -165,6 +169,7 @@ class BatchManager:
         self.discard_completed_seqs(iter_id)
         self.add_new_tokens(iter_id)
         self.load_seqs_to_gpu()
+        # print(f"Iter id {iter_id}: ", len(self.running_queue), len(self.wait_queue))
 
     def get_input_num_seqs(self):
         # HACK(Soo): Create redundant input to prevent illegal memory access from all_gather for CP case
