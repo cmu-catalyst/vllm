@@ -379,20 +379,23 @@ if __name__ == "__main__":
 
     # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
     # Setting for throughput vs. sequence length
-    # max_kv_cache_context_lens = [i for i in range(10000, 50001, 5000)]
-    # num_seqs_arr = [16] #, 128, 1024]
+    max_kv_cache_context_lens = []
+    max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
+    max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
+    max_kv_cache_context_lens.append([i for i in range(1000, 5001, 500)])
+    num_seqs_arr = [16, 128, 1024]
 
     # debug
-    max_kv_cache_context_lens = [10000]
-    num_seqs_arr = [64]
+    # max_kv_cache_context_lens = [10000]
+    # num_seqs_arr = [64]
 
     # Setting for throughput vs. latency
     # max_kv_cache_context_lens = [1000, 10000, 100000]
     # max_kv_cache_context_lens = [50000]
     # num_seqs_arr = [16, 32, 64, 128, 256, 512, 1024]
 
-    for n_seqs in num_seqs_arr:
-        for cache_len in max_kv_cache_context_lens:
+    for n_idx, n_seqs in enumerate(num_seqs_arr):
+        for cache_len in max_kv_cache_context_lens[n_idx]:
             for p_type in p_types:
                 eval_cfg.p_type = p_type
                 eval_cfg.max_kv_cache_context_len = cache_len
