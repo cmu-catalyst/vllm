@@ -105,18 +105,18 @@ def adjust_configs_by_parallelism_type(
 
 def init_context_lens(
         max_kv_cache_context_len: int,
+        n_min_decode_iters: int,
+        n_max_decode_iters: int,
         num_seqs: int,
         n_gpus: int,
         device: torch.device,
         long_seq_ratio: float = 0.2,
         min_seq_len_multiplier: float = 0.1,
         min_seq_len: int = 10,
-        n_min_decode_iters: int = 10,
-        n_max_decode_iters: int = 100,
 ):
     min_kv_cache_context_len = max(int(min_seq_len_multiplier * max_kv_cache_context_len), min_seq_len)
     context_lens = [max_kv_cache_context_len for _ in range(num_seqs)]
-    target_context_lens = [0 for _ in range(num_seqs)]
+    target_context_lens = [max_kv_cache_context_len + n_max_decode_iters for _ in range(num_seqs)]
     n_long_seqs = int(num_seqs * long_seq_ratio)
 
     for i, l in enumerate(context_lens):
@@ -124,8 +124,9 @@ def init_context_lens(
             start_len = min_kv_cache_context_len
             end_len = min(2 * min_kv_cache_context_len, max_kv_cache_context_len)
             context_lens[i] = (random.randint(start_len, end_len) // n_gpus) * n_gpus
-        n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
-        target_context_lens[i] = context_lens[i] + n_decode_iters
+
+            n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
+            target_context_lens[i] = context_lens[i] + n_decode_iters
 
     # Fair load balancing for DP (in case of long prefix case)
     # num_seqs_per_gpu = num_seqs // n_gpus
@@ -155,7 +156,8 @@ def run_local_model(
     # Input / Model configs
     # TODO(Soo): Test with varying KV cache context length
     context_lens, target_context_lens = init_context_lens(
-        cfg.max_kv_cache_context_len, cfg.num_seqs, cfg.n_gpus, device)
+        cfg.max_kv_cache_context_len, cfg.n_min_decode_iters, cfg.n_max_decode_iters,
+        cfg.num_seqs, cfg.n_gpus, device)
     n_total_tokens = sum([t - c for (c, t) in zip(context_lens, target_context_lens)])
     context_lens = torch.tensor(context_lens, dtype=torch.int, device=device)
 
@@ -355,7 +357,10 @@ if __name__ == "__main__":
         model_name = "Llama-7B",
         num_seqs = 1024, # num_seqs * max_kv_cache_context_lens should be less than 1280000
 
-        max_kv_cache_context_len = 2000,
+        max_kv_cache_context_len = 10000,
+        n_min_decode_iters = 10,
+        n_max_decode_iters = 100,
+
         # num_layers = 32,
         num_layers = 1,
         llama_cfg = LlamaConfig(), # Load Llama-7B configurations
@@ -366,32 +371,30 @@ if __name__ == "__main__":
         # Note(Soo): 1000 is max # of blocks (Llama-7B 32 layers)
         # num_blocks = 1000,
         num_blocks = 80000,
-        # num_blocks = 10000, # Debug
+        # num_blocks = 100, # Debug
         block_size = 16,
         partition_size = 512,
     )
 
+    # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
+    # Long prefix: Throughput vs. seqnuence length
     p_types = ["cp", "tp", "dp"]
     # p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
-    # p_types = ["dp", "tp"]
 
-    # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
-    # Setting for throughput vs. sequence length
-    max_kv_cache_context_lens = []
-    max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
-    max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
-    max_kv_cache_context_lens.append([i for i in range(1000, 5001, 500)])
-    num_seqs_arr = [16, 128, 1024]
+    # max_kv_cache_context_lens = []
+    # max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
+    # max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
+    # max_kv_cache_context_lens.append([i for i in range(1000, 5001, 500)])
+    # num_seqs_arr = [16, 128, 1024]
 
-    # debug
-    # max_kv_cache_context_lens = [10000]
-    # num_seqs_arr = [64]
+    # Debug
+    max_kv_cache_context_lens = [[10000], [10000]]
+    num_seqs_arr = [16, 128]
 
     # Setting for throughput vs. latency
-    # max_kv_cache_context_lens = [1000, 10000, 100000]
-    # max_kv_cache_context_lens = [50000]
+    # max_kv_cache_context_lens = [[1000, 10000, 100000]]
     # num_seqs_arr = [16, 32, 64, 128, 256, 512, 1024]
 
     for n_idx, n_seqs in enumerate(num_seqs_arr):
@@ -406,3 +409,37 @@ if __name__ == "__main__":
                                             args=(eval_cfg,),
                                             nprocs=eval_cfg.n_gpus,
                                             join=True)
+
+    # Long decode: Throughput vs. seqnuence length
+    # p_types = ["cp", "tp", "dp"]
+    # p_types = ["cp"]
+    # p_types = ["dp"]
+    # p_types = ["tp"]
+
+    # n_min_decode_iters_arr, n_max_decode_iters_arr = [], []
+    # n_min_decode_iters_arr.append([i for i in range(5000, 45001, 5000)])
+    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 5000)])
+    # n_min_decode_iters_arr.append([i for i in range(5000, 45001, 5000)])
+    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 5000)])
+    # n_min_decode_iters_arr.append([i for i in range(500, 4501, 500)])
+    # n_max_decode_iters_arr.append([i for i in range(1000, 5001, 500)])
+    # num_seqs_arr = [16, 128, 1024]
+
+    # Debug
+    # n_min_decode_iters_arr = [[10000]]
+    # n_max_decode_iters_arr = [[15000]]
+    # num_seqs_arr = [64]
+    #
+    # for n_idx, n_seqs in enumerate(num_seqs_arr):
+    #     for n_min_decode_iters, n_max_decode_iters in zip(n_min_decode_iters_arr[n_idx], n_max_decode_iters_arr[n_idx]):
+    #         for p_type in p_types:
+    #             eval_cfg.p_type = p_type
+    #             eval_cfg.n_min_decode_iters = n_min_decode_iters
+    #             eval_cfg.n_max_decode_iters = n_max_decode_iters
+    #             eval_cfg.num_seqs = n_seqs
+    #
+    #             check_eval_configs(eval_cfg)
+    #             torch.multiprocessing.spawn(run_distributed_model,
+    #                                         args=(eval_cfg,),
+    #                                         nprocs=eval_cfg.n_gpus,
+    #                                         join=True)
