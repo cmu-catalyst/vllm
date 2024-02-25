@@ -91,6 +91,7 @@ class BatchManager:
         self.rank = rank
         self.device = device
         self.hidden_size = hidden_size
+        self.max_batch_size = cfg.max_batch_size
 
         # WARNING(SOO): Do not use SortedList! It does not use __eq__ in Sequence and cause errors!
         self.running_queue = []
@@ -149,6 +150,10 @@ class BatchManager:
                     self.evict_seq_to_cpu_and_put_it_on_hold()
 
     def load_seqs_to_gpu(self):
+        assert self.max_batch_size >= len(self.running_queue)
+        if self.max_batch_size == len(self.running_queue):
+            return
+
         tmp_wait_queue = copy.deepcopy(self.wait_queue)
         tmp_total_seq_len = 0
         for seq in tmp_wait_queue:
@@ -157,6 +162,8 @@ class BatchManager:
                 tmp_total_seq_len += seq.cur_len
                 self.running_queue.append(seq)
                 self.wait_queue.remove(seq)
+                if self.max_batch_size == len(self.running_queue):
+                    return
 
         # TODO(Soo): Replace it with real KV cache swap logic
         if tmp_total_seq_len > 0:

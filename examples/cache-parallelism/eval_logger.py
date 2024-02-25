@@ -22,6 +22,7 @@ class EvaluationConfig:
         max_kv_cache_context_len: int,
         n_min_decode_iters: int,
         n_max_decode_iters: int,
+        max_batch_size: int,
         num_layers: int,
         llama_cfg: LlamaConfig,
 
@@ -43,7 +44,7 @@ class EvaluationConfig:
         self.max_kv_cache_context_len = max_kv_cache_context_len
         self.n_min_decode_iters = n_min_decode_iters
         self.n_max_decode_iters = n_max_decode_iters
-
+        self.max_batch_size = max_batch_size
 
         self.num_layers = num_layers
         self.llama_cfg = llama_cfg

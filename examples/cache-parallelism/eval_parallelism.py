@@ -283,11 +283,16 @@ def save_result_to_file(
 ):
     eval_logger = EvaluationLogger(cfg.output_file_path)
 
+    # HACK(Soo): Save # of decode iterations as a seq len with following condition
+    tmp_seq_len = cfg.max_kv_cache_context_len
+    if cfg.n_max_decode_iters > 100:
+        tmp_seq_len = cfg.n_max_decode_iters
+
     # Add a evaluation data point
     eval_logger.add_result(
         model=cfg.model_name,
         batch_size=cfg.num_seqs,
-        seq_len=cfg.max_kv_cache_context_len,
+        seq_len=tmp_seq_len,
         p_type=cfg.p_type,
         measurement=measurement,
     )
@@ -357,9 +362,10 @@ if __name__ == "__main__":
         model_name = "Llama-7B",
         num_seqs = 1024, # num_seqs * max_kv_cache_context_lens should be less than 1280000
 
-        max_kv_cache_context_len = 10000,
+        max_kv_cache_context_len = 1000,
         n_min_decode_iters = 10,
         n_max_decode_iters = 100,
+        max_batch_size = float('inf'),
 
         # num_layers = 32,
         num_layers = 1,
@@ -375,6 +381,7 @@ if __name__ == "__main__":
         block_size = 16,
         partition_size = 512,
     )
+    assert eval_cfg.n_max_decode_iters == 100, "If not, fix Hack in save_result_to_file function"
 
     # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
     # Long prefix: Throughput vs. seqnuence length
@@ -384,25 +391,27 @@ if __name__ == "__main__":
     # p_types = ["tp"]
 
     # max_kv_cache_context_lens = []
-    # max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
-    # max_kv_cache_context_lens.append([i for i in range(10000, 50001, 5000)])
-    # max_kv_cache_context_lens.append([i for i in range(1000, 5001, 500)])
+    # max_kv_cache_context_lens.append([i for i in range(50000, 100001, 10000)])
+    # max_kv_cache_context_lens.append([i for i in range(10000, 50001, 10000)])
+    # max_kv_cache_context_lens.append([i for i in range(5000, 10001, 1000)])
     # num_seqs_arr = [16, 128, 1024]
 
     # Debug
-    max_kv_cache_context_lens = [[10000], [10000]]
-    num_seqs_arr = [16, 128]
+    max_kv_cache_context_lens = [[100000]]#, [10000]]
+    num_seqs_arr = [64]#, 128]
+    max_batch_size_arr = [16]
 
     # Setting for throughput vs. latency
     # max_kv_cache_context_lens = [[1000, 10000, 100000]]
     # num_seqs_arr = [16, 32, 64, 128, 256, 512, 1024]
 
-    for n_idx, n_seqs in enumerate(num_seqs_arr):
+    for n_idx, (n_seqs, max_bs) in enumerate(zip(num_seqs_arr, max_batch_size_arr)):
         for cache_len in max_kv_cache_context_lens[n_idx]:
             for p_type in p_types:
                 eval_cfg.p_type = p_type
                 eval_cfg.max_kv_cache_context_len = cache_len
                 eval_cfg.num_seqs = n_seqs
+                eval_cfg.max_batch_size = max_bs
 
                 check_eval_configs(eval_cfg)
                 torch.multiprocessing.spawn(run_distributed_model,
@@ -411,24 +420,25 @@ if __name__ == "__main__":
                                             join=True)
 
     # Long decode: Throughput vs. seqnuence length
+    # eval_cfg.n_eval_iters = 1 # This is enough to remove variance since # of iterations is large
     # p_types = ["cp", "tp", "dp"]
-    # p_types = ["cp"]
-    # p_types = ["dp"]
-    # p_types = ["tp"]
-
+    # # p_types = ["cp"]
+    # # p_types = ["dp"]
+    # # p_types = ["tp"]
+    #
     # n_min_decode_iters_arr, n_max_decode_iters_arr = [], []
-    # n_min_decode_iters_arr.append([i for i in range(5000, 45001, 5000)])
-    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 5000)])
-    # n_min_decode_iters_arr.append([i for i in range(5000, 45001, 5000)])
-    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 5000)])
-    # n_min_decode_iters_arr.append([i for i in range(500, 4501, 500)])
-    # n_max_decode_iters_arr.append([i for i in range(1000, 5001, 500)])
+    # n_min_decode_iters_arr.append([i for i in range(5000, 45001, 10000)])
+    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 10000)])
+    # n_min_decode_iters_arr.append([i for i in range(3000, 23001, 5000)])
+    # n_max_decode_iters_arr.append([i for i in range(5000, 25001, 5000)])
+    # n_min_decode_iters_arr.append([i for i in range(500, 4501, 1000)])
+    # n_max_decode_iters_arr.append([i for i in range(1000, 5001, 1000)])
     # num_seqs_arr = [16, 128, 1024]
-
-    # Debug
-    # n_min_decode_iters_arr = [[10000]]
-    # n_max_decode_iters_arr = [[15000]]
-    # num_seqs_arr = [64]
+    #
+    # # Debug
+    # # n_min_decode_iters_arr = [[10000]]
+    # # n_max_decode_iters_arr = [[15000]]
+    # # num_seqs_arr = [64]
     #
     # for n_idx, n_seqs in enumerate(num_seqs_arr):
     #     for n_min_decode_iters, n_max_decode_iters in zip(n_min_decode_iters_arr[n_idx], n_max_decode_iters_arr[n_idx]):
