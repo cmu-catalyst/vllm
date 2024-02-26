@@ -92,6 +92,7 @@ class BatchManager:
         self.device = device
         self.hidden_size = hidden_size
         self.max_batch_size = cfg.max_batch_size
+        self.is_reach_max_batch_size = False
 
         # WARNING(SOO): Do not use SortedList! It does not use __eq__ in Sequence and cause errors!
         self.running_queue = []
@@ -152,6 +153,7 @@ class BatchManager:
     def load_seqs_to_gpu(self):
         assert self.max_batch_size >= len(self.running_queue)
         if self.max_batch_size == len(self.running_queue):
+            self.is_reach_max_batch_size = True
             return
 
         tmp_wait_queue = copy.deepcopy(self.wait_queue)
