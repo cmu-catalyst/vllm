@@ -205,8 +205,8 @@ class BatchManager:
         context_lens = []
         max_context_len = 0
 
-        input_num_seqs = self.get_input_num_seqs()
-        kv_cache_num_seqs = len(self.running_queue)
+        # input_num_seqs = self.get_input_num_seqs()
+        # kv_cache_num_seqs = len(self.running_queue)
         for seq in self.running_queue:
             cur_block_tables.append(self.imaginary_all_block_tables[seq.idx])
             context_lens.append(seq.cur_len)
@@ -214,10 +214,10 @@ class BatchManager:
                 max_context_len = seq.cur_len
 
         # HACK(Soo): Create redundant input to prevent illegal memory access from all_gather for CP case
-        while self.cfg.p_type == "cp" and kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
-            context_lens.append(1)
-            cur_block_tables.append(self.imaginary_all_block_tables[0])
-            kv_cache_num_seqs += 1
+        # while self.cfg.p_type == "cp" and kv_cache_num_seqs < input_num_seqs * self.cfg.n_gpus:
+        #     context_lens.append(1)
+        #     cur_block_tables.append(self.imaginary_all_block_tables[0])
+        #     kv_cache_num_seqs += 1
 
         # print(f"conlen shape (rank {self.rank}): ", len(context_lens))
         # print(f"bt shape (rank {self.rank}): ", len(cur_block_tables))

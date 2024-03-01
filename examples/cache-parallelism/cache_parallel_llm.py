@@ -26,6 +26,9 @@ def _distributed_paged_attention(
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    batch_size = len(input_metadata.context_lens)
+    query = query[:batch_size, :, :]
+
     block_size = value_cache.shape[3]
     num_seqs, num_heads, head_size = query.shape
 
@@ -92,6 +95,7 @@ def _distributed_paged_attention(
         output_list,
         world_size
     )
+
 
     return global_output
 
