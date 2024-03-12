@@ -31,8 +31,8 @@ def get_throughput_vs_latency(file_path, model_name, seq_len):
     batch_sizes = list(result_dic[model_name].keys())
     batch_sizes = [int(bs) for bs in batch_sizes]
     batch_sizes.sort()
-    batch_sizes.remove(128)
-    batch_sizes.remove(256)
+    # batch_sizes.remove(128)
+    # batch_sizes.remove(256)
 
     plot_dic = {
         METHOD_STR: [],
@@ -57,7 +57,7 @@ def get_throughput_vs_latency(file_path, model_name, seq_len):
 
 def to_k(value, pos):
     """Convert number to thousand (K) format."""
-    return f'{int(value / 1000)}K'
+    return f'{value / 1000:.1f}K'
 
 def draw_throughput_vs_seq_len_plot(df, out_file_path):
     # Line Plot
@@ -129,21 +129,23 @@ if __name__ == "__main__":
     set_plt_font_size()
     
     # Plot throughput vs num_seq
-    num_seqs = [16, 128, 1024]
-    result_path = "/home/byungsoj/eval_results/result.json"
+    num_seqs = [128]#[32, 128, 512]
+    # result_path = "/home/byungsoj/eval_results/result.json"
+    # result_path = "/home/byungsoj/eval_results/long-decode-0225.json"
+    result_path = "/home/byungsoj/eval_results/long-decode-0308.json"
     model_name = "Llama-7B"
     for num_seq in num_seqs:
-        out_file_path = f"/home/byungsoj/eval_results/{model_name}_b{num_seq}_throughput_vs_seqlen.pdf"
+        out_file_path = f"/home/byungsoj/eval_results/plots/{model_name}_b{num_seq}_throughput_vs_seqlen_long_decode.pdf"
         df = create_df_throughput_vs_seq_len(result_path, model_name, str(num_seq))
         draw_throughput_vs_seq_len_plot(df, out_file_path)
 
-    seq_lens = [10000, 50000, 100000]
-    result_path = "/home/byungsoj/eval_results/result.json"
-    model_name = "Llama-7B"
-    for seq_len in seq_lens:
-        out_file_path = f"/home/byungsoj/eval_results/{model_name}_s{seq_len}_throughput_vs_latency.pdf"
-        df = get_throughput_vs_latency(result_path, model_name, str(seq_len))
-        draw_throughput_vs_latency_plot(df, out_file_path)
+    # seq_lens = [10000, 40000, 80000]
+    # result_path = "/home/byungsoj/eval_results/tradeoff-0225.json"
+    # model_name = "Llama-7B"
+    # for seq_len in seq_lens:
+    #     out_file_path = f"/home/byungsoj/eval_results/plots/{model_name}_s{seq_len}_throughput_vs_latency.pdf"
+    #     df = get_throughput_vs_latency(result_path, model_name, str(seq_len))
+    #     draw_throughput_vs_latency_plot(df, out_file_path)
 
 
 

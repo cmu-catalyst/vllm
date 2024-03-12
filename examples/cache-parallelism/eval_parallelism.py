@@ -361,6 +361,7 @@ if __name__ == "__main__":
         n_eval_iters = 3,
         n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
+        trace_dir_path="/home/byungsoj/eval_results/prof_traces/trace_dir",
         rand_seed = 0,
         p_type="cp",
 
@@ -398,6 +399,7 @@ if __name__ == "__main__":
     # p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
+    # p_types = ["tp", "dp"]
 
     # max_kv_cache_context_lens = []
     # max_kv_cache_context_lens.append([i for i in range(50000, 100001, 10000)])
@@ -407,9 +409,9 @@ if __name__ == "__main__":
     # max_batch_size_arr = [32, 128, 512]
 
     # Debug
-    # max_kv_cache_context_lens = [[25000, 30000]]#, [10000]]
-    # num_seqs_arr = [512]#, 128]
-    # max_batch_size_arr = [512]
+    # max_kv_cache_context_lens = [[10000]]
+    # num_seqs_arr = [32]#, 128]
+    # max_batch_size_arr = [32]
 
     # Setting for throughput vs. latency
     # seq_len (10000) - max_batch_size (512), 40000 - 128, 80000 - 64
@@ -432,7 +434,7 @@ if __name__ == "__main__":
     #                                         join=True)
 
     # Long decode: Throughput vs. seqnuence length
-    eval_cfg.output_file_path = "/home/byungsoj/eval_results/long-decode-0225.json"
+    eval_cfg.output_file_path = "/home/byungsoj/eval_results/long-decode-0308.json"
     eval_cfg.n_eval_iters = 1 # This is enough to remove variance since # of iterations is large
     eval_cfg.max_kv_cache_context_len = 10000
 
@@ -441,21 +443,22 @@ if __name__ == "__main__":
     # p_types = ["dp"]
     # p_types = ["tp"]
 
-    # n_min_decode_iters_arr, n_max_decode_iters_arr = [], []
-    # n_min_decode_iters_arr.append([i for i in range(5000, 45001, 10000)])
-    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 10000)])
-    # n_min_decode_iters_arr.append([i for i in range(3000, 23001, 5000)])
-    # n_max_decode_iters_arr.append([i for i in range(5000, 25001, 5000)])
-    # n_min_decode_iters_arr.append([i for i in range(4500, 9501, 1000)])
-    # n_max_decode_iters_arr.append([i for i in range(5000, 10001, 1000)])
-    # num_seqs_arr = [32, 128, 512]
-    # max_batch_size_arr = [32, 128, 512]
+    n_min_decode_iters_arr, n_max_decode_iters_arr = [], []
+    min_seq_len_multiplier = 0.2
+    n_max_decode_iters_arr.append([i for i in range(10000, 50001, 10000)])
+    n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
+    n_max_decode_iters_arr.append([i for i in range(5000, 25001, 5000)])
+    n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
+    n_max_decode_iters_arr.append([i for i in range(1000, 5001, 1000)])
+    n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
+    num_seqs_arr = [32, 128, 512]
+    max_batch_size_arr = [32, 128, 512]
 
     # Debug
-    n_min_decode_iters_arr = [[3500]]
-    n_max_decode_iters_arr = [[4000]]
-    num_seqs_arr = [512]
-    max_batch_size_arr = [512]
+    # n_min_decode_iters_arr = [[500, 1500, 2500]]
+    # n_max_decode_iters_arr = [[1000, 2000, 3000]]
+    # num_seqs_arr = [512]
+    # max_batch_size_arr = [512]
 
     for n_idx, (n_seqs, max_bs) in enumerate(zip(num_seqs_arr, max_batch_size_arr)):
         for n_min_decode_iters, n_max_decode_iters in zip(n_min_decode_iters_arr[n_idx], n_max_decode_iters_arr[n_idx]):

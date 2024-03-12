@@ -1,58 +1,62 @@
 import json
 import pandas as pd
 import numpy as np
+import copy
 
 from plot_util import set_plt_font_size
 import matplotlib.pyplot as plt
 from matplotlib import ticker as mticker
 from matplotlib.ticker import FuncFormatter
 
-def draw_cost_breakdown_plot(df, file_path):
-    fig_size = (13, 13)
-    ax = df.plot(kind='bar', stacked=True, figsize=fig_size)
-    plt.xlabel('Sequence Length')
-    # plt.xticks(rotation=45)
-    plt.ylabel('Time (ms)')
-    # plt.title('Stacked Bar Plot of Execution Time by Sequence Length and Cost Type')
+def to_k(value, pos=None):
+    """Convert number to thousand (K) format."""
+    return f'{value / 1000.0:.1f}K'
+
+    """Convert number to thousand (K) format."""
+def draw_cost_breakdown_plot(df, file_path, cost_type):
+    fig_size = (12, 9)
+
+    df_plot = df.pivot(index='Sequence Length', columns='Parallelism Type', values=cost_type)
+    df_plot = df_plot/1000.0
+    df_plot.index = df_plot.index.map(to_k)
+
+    if cost_type == "comm":
+        df_plot.plot.bar(rot=0, figsize=fig_size, color=['C2', 'C0'])
+    else:
+        df_plot.plot.bar(rot=0, figsize=fig_size, color=['C2', 'C1', 'C0'])
+
+    # formatter = FuncFormatter(to_k)
+    # plt.gca().yaxis.set_major_formatter(formatter)
+
+    plt.xlabel("Sequence Length")
+    plt.ylabel("Execution Time (ms)")
+    # plt.title(f"Execution Time for {cost_type.capitalize()} Cost Type")
     plt.legend(loc='upper center', bbox_to_anchor=(0.5, 1.2), ncol=3)
     plt.tight_layout()
     plt.savefig(file_path, bbox_inches='tight')
 
 def get_df_from_dic(data):
-    rows = []
-    for seq_len, par_types in data.items():
-        for par_type, costs in par_types.items():
-            for cost_type, execution_time in costs.items():
-                rows.append({'Sequence Length': seq_len, 'Parallelism Type': par_type, 'Cost Type': cost_type,
-                             'Execution Time': execution_time})
-
-    df = pd.DataFrame(rows)
-    df['Cost Type'] = df['Cost Type'].replace("comp", "Compute")
-    df['Cost Type'] = df['Cost Type'].replace("comm", "Communication")
-    df['Cost Type'] = df['Cost Type'].replace("others", "Data Transfer")
-    
-    # Pivot the DataFrame to make it suitable for a stacked bar plot
-    # df = df.pivot_table(index=['Sequence Length', 'Parallelism Type'], columns='Cost Type',
-    #                           values='Execution Time', aggfunc='sum')
-    df['Group'] = '(' + df['Sequence Length'] + ', ' + df['Parallelism Type'] + ')'
-    df = df.pivot_table(index='Group', columns='Cost Type', values='Execution Time', aggfunc='sum')
-
-    # Step 3: Sort the DataFrame based on these numeric valueps
-    # Create a temporary column for sorting, if you don't want to modify the original index
-    numeric_index = np.array(list(df.index.str.split(',')))[:,0]
-    numeric_index = [int(s[1:]) for s in numeric_index]
-    df['SortKey'] = numeric_index
-    df = df.sort_values(by='SortKey').drop(columns=['SortKey'])
-
+    df = pd.DataFrame.from_dict({(i, j): data[i][j] for i in data.keys() for j in data[i].keys()}, orient='index')
+    df.index.names = ['Sequence Length', 'Parallelism Type']
+    df = df.reset_index()
+    df['Parallelism Type'] = df['Parallelism Type'].str.upper()
+    df['Sequence Length'] = df['Sequence Length'].astype(int)
+    # print(df)
     return df
 
 
 if __name__ == "__main__":
     set_plt_font_size()
-    result_path = "/home/byungsoj/eval_results/final_result/round1/cost-breakdown.json"
+    result_path = "/home/byungsoj/eval_results/final_result/round2/cost-breakdown.json"
     with open(result_path, 'r') as file:
         result_dic = json.load(file)
 
     df = get_df_from_dic(result_dic)
-    out_file_path = f"/home/byungsoj/eval_results/plots/cost_breakdown.pdf"
-    draw_cost_breakdown_plot(df, out_file_path)
+
+    # Iterate over cost types and create separate plots
+    for cost_type in ["comp", "others", "comm"]:
+        out_file_path = f"/home/byungsoj/eval_results/plots/cost_breakdown_{cost_type}.pdf"
+        df_to_plot = copy.deepcopy(df)
+        if cost_type == "comm":
+            df_to_plot = df_to_plot[df_to_plot['Parallelism Type'] != 'DP']
+        draw_cost_breakdown_plot(df_to_plot, out_file_path, cost_type)

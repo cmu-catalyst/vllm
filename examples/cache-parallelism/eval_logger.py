@@ -12,6 +12,7 @@ class EvaluationConfig:
         n_eval_iters: int,
         n_warmup_iters: int,
         output_file_path: str,
+        trace_dir_path: str,
         rand_seed: int,
         p_type: str,
 
@@ -35,6 +36,7 @@ class EvaluationConfig:
         self.n_eval_iters = n_eval_iters
         self.n_warmup_iters = n_warmup_iters
         self.output_file_path = output_file_path
+        self.trace_dir_path = trace_dir_path
         self.rand_seed = rand_seed
         self.p_type = p_type
 

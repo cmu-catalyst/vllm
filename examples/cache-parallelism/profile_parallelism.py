@@ -250,7 +250,7 @@ def run_local_model(
         with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=torch.profiler.schedule(wait=1, warmup=1, active=5, repeat=2),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler('/home/byungsoj/eval_results/trace_dir'),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(cfg.trace_dir_path),
                 record_shapes=True,
                 with_stack=True,  # Optional: capture call stack information for more insights
                 profile_memory=True,  # Track memory allocations
@@ -382,6 +382,7 @@ if __name__ == "__main__":
         n_eval_iters = 3,
         n_warmup_iters = 1,
         output_file_path = "/home/byungsoj/eval_results/result.json",
+        trace_dir_path="/home/byungsoj/eval_results/prof_traces/trace_dir",
         rand_seed = 0,
         p_type="cp",
 
@@ -415,7 +416,7 @@ if __name__ == "__main__":
     # Long prefix: Throughput vs. seqnuence length
     eval_cfg.output_file_path = "/home/byungsoj/eval_results/profile-result.json"
     eval_cfg.n_eval_iters = 1  # This is enough to remove variance since # of iterations is large
-    # p_types = ["cp", "tp", "dp"]
+    p_types = ["cp", "tp", "dp"]
     # p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
@@ -428,8 +429,9 @@ if __name__ == "__main__":
     # max_batch_size_arr = [32, 128, 512]
 
     # Debug
-    max_kv_cache_context_lens = [[10000]]
-    # max_kv_cache_context_lens.append([i for i in range(50000, 100001, 10000)])
+    # max_kv_cache_context_lens = [[50000], [50000], [10000]]
+    max_kv_cache_context_lens = []
+    max_kv_cache_context_lens.append([i for i in range(60000, 100001, 10000)])
     num_seqs_arr = [32]#, 128]
     max_batch_size_arr = [32]
 
@@ -446,6 +448,7 @@ if __name__ == "__main__":
                 eval_cfg.max_kv_cache_context_len = cache_len
                 eval_cfg.num_seqs = n_seqs
                 eval_cfg.max_batch_size = max_bs
+                eval_cfg.trace_dir_path = f"/home/byungsoj/eval_results/prof_traces/trace_b{n_seqs}_s{cache_len}_{p_type}"
 
                 check_eval_configs(eval_cfg)
                 torch.multiprocessing.spawn(run_distributed_model,
