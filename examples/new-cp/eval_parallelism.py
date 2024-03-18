@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from transformers import LlamaConfig
 from llama_llm import LlamaModel
-from cache_parallel_llm import CacheParallelDecodeLlamaAttention, CacheParallelDecodeLlamaLayer
+from cache_parallel_llm import CacheParallelDecodeLlamaAttention, CacheParallelDecodeLlamaLayer, _distributed_paged_attention
 from data_parallel_llm import DataParallelDecodeLlamaAttention, DataParallelDecodeLlamaLayer
 from tensor_parallel_llm import TensorParallelDecodeLlamaAttention, TensorParallelDecodeLlamaLayer
 from synthetic_data_utils import gen_random_kv_cache
@@ -81,16 +81,21 @@ def adjust_configs_by_parallelism_type(
         rank: int,
 ):
     p_type = cfg.p_type
-    if p_type == "cp":
-        context_lens = context_lens // cfg.n_gpus
-        target_context_lens = [i // cfg.n_gpus for i in target_context_lens]
-    elif p_type == "dp":
+    # if p_type == "cp":
+        # context_lens = context_lens // cfg.n_gpus
+        # target_context_lens = [i // cfg.n_gpus for i in target_context_lens]
+    if p_type == "cp" or p_type == "dp":
         num_seqs_per_gpu = cfg.num_seqs // cfg.n_gpus
 
         start_idx = rank * num_seqs_per_gpu
         end_idx = rank * num_seqs_per_gpu + num_seqs_per_gpu
         context_lens = context_lens[start_idx:end_idx]
         target_context_lens = target_context_lens[start_idx:end_idx]
+
+        if rank == 0:
+            context_lens = context_lens // cfg.n_gpus
+            target_context_lens = [i // cfg.n_gpus for i in target_context_lens]
+
     elif p_type == "tp":
         pass
     else:
@@ -111,7 +116,7 @@ def init_context_lens(
         n_gpus: int,
         device: torch.device,
         long_seq_ratio: float = 0.2,
-        min_seq_len_multiplier: float = 0.2,
+        min_seq_len_multiplier: float = 0.1,
         min_seq_len: int = 10,
 ):
     min_kv_cache_context_len = max(int(min_seq_len_multiplier * max_kv_cache_context_len), min_seq_len)
@@ -123,9 +128,11 @@ def init_context_lens(
         if i >= n_long_seqs:
             start_len = min_kv_cache_context_len
             end_len = min(2 * min_kv_cache_context_len, max_kv_cache_context_len)
-            context_lens[i] = (random.randint(start_len, end_len) // n_gpus) * n_gpus
+            # context_lens[i] = (random.randint(start_len, end_len) // n_gpus) * n_gpus
+            context_lens[i] = random.randint(start_len, end_len) // n_gpus
 
-            n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
+            # n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
+            n_decode_iters = random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus
             target_context_lens[i] = context_lens[i] + n_decode_iters
 
     # Fair load balancing for DP (in case of long prefix case)
@@ -143,6 +150,27 @@ def init_context_lens(
 
     return context_lens, target_context_lens
 
+def attn_for_rank0_from_other_ranks(rank, n_rank0_batch_size, cfg, device, hidden_size,
+                                    key_cache, value_cache, input_metadata, scale, n_kv_heads,
+                                    num_heads, head_size):
+    decode_n_tokens = 1
+    qkv_rank0 = torch.zeros([n_rank0_batch_size, decode_n_tokens, hidden_size*3],
+                            device=device, dtype=cfg.dtype)
+    torch.distributed.broadcast(qkv_rank0, src=0)
+    q, _, _ = qkv_rank0.split([hidden_size, hidden_size, hidden_size], dim=-1)
+    q = q.view(-1, num_heads, head_size)
+
+    output = _distributed_paged_attention(
+        rank,
+        cfg.n_gpus,
+        q,
+        key_cache,
+        value_cache,
+        input_metadata,
+        n_kv_heads,
+        scale,
+        None,
+    )
 
 @torch.inference_mode()
 def run_local_model(
@@ -160,6 +188,9 @@ def run_local_model(
     context_lens, target_context_lens = init_context_lens(
         cfg.max_kv_cache_context_len, cfg.n_min_decode_iters, cfg.n_max_decode_iters,
         cfg.num_seqs, cfg.n_gpus, device)
+    rank0_target_context_lens = target_context_lens[:(cfg.num_seqs // cfg.n_gpus)]
+    rank0_target_context_lens = [tcl // cfg.n_gpus for tcl in rank0_target_context_lens]
+
     n_total_tokens = sum([t - c for (c, t) in zip(context_lens, target_context_lens)])
     context_lens = torch.tensor(context_lens, dtype=torch.int, device=device)
 
@@ -181,6 +212,9 @@ def run_local_model(
         rank=rank,
     )
     cfg.max_kv_cache_context_len = max(context_lens.cpu().numpy())
+
+    # print("rank0 tcl: ", rank, rank0_target_context_lens)
+    # print("tcl: ",rank, target_context_lens)
 
     model_args = {
         "n_gpus": cfg.n_gpus,
@@ -235,21 +269,37 @@ def run_local_model(
     # TODO(Soo): Increase KV cache size over iterations
     # print("con len: ", context_lens)
     # print("target con len: ", target_context_lens)
+
     arr_elapsed_time_ms = []
+
     for _ in range(cfg.n_warmup_iters + cfg.n_eval_iters):
         # Initialize batch manager
         batch_manager = BatchManager(
-            cfg, rank, device, hidden_size, context_lens, target_context_lens, kv_caches, cpu_kv_caches)
+            cfg, rank, device, hidden_size, context_lens, target_context_lens, kv_caches, cpu_kv_caches,
+            rank0_target_context_lens)
 
         # Measure time
         # Creating start and end events
         start_time = time.perf_counter()
         iter_id = 1
-        while batch_manager.is_running():
-            hidden_states = batch_manager.gen_hidden_states(scale)
-            input_metadata = batch_manager.gen_input_metadata()
+        while True:
+            batch_manager.synchronize_with_rank0_batch_size()
+            if not batch_manager.is_running():
+                break
 
-            output = model(hidden_states, kv_caches, input_metadata)
+            input_metadata = batch_manager.gen_input_metadata()
+            # We need to break if rank0 is done after update in rank0 status in get_input_metadata()
+
+            hidden_states = batch_manager.gen_hidden_states(scale)
+
+            # print(f"(Rank, Iter, rank0-bs, cur_bs) = ({rank}, {iter_id}, {batch_manager.n_rank0_batch_size}, {len(batch_manager.running_queue)}) ")
+            is_wait_for_rank_0 = not batch_manager.running_queue and not batch_manager.wait_queue and batch_manager.n_rank0_batch_size > 0
+            if rank > 0 and is_wait_for_rank_0:
+                attn_for_rank0_from_other_ranks(rank, batch_manager.n_rank0_batch_size, cfg, device, hidden_size,
+                                                kv_caches[0], kv_caches[1], input_metadata, scale, num_kv_heads,
+                                                num_heads, head_size)
+            else:
+                output = model(hidden_states, kv_caches, input_metadata)
 
             batch_manager.update(iter_id)
             # if rank == 0:
@@ -261,8 +311,8 @@ def run_local_model(
 
         torch.distributed.barrier()
         end_time = time.perf_counter()
-        if not batch_manager.is_reach_max_batch_size and cfg.p_type != "dp" and rank == 0:
-            print(f"It can't reach max batch size ({cfg.max_batch_size})")
+        # if not batch_manager.is_reach_max_batch_size and cfg.p_type != "dp" and rank == 0:
+        #     print(f"It can't reach max batch size ({cfg.max_batch_size})")
         # print(rank, cfg.p_type, batch_manager.n_add_seqs)
 
 
@@ -393,10 +443,10 @@ if __name__ == "__main__":
 
     # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
     # Long prefix: Throughput vs. seqnuence length
-    # eval_cfg.output_file_path = "/home/byungsoj/eval_results/long-prefix-0225.json"
-    # eval_cfg.n_eval_iters = 1  # This is enough to remove variance since # of iterations is large
+    eval_cfg.output_file_path = "/home/byungsoj/eval_results/test.json"
+    eval_cfg.n_eval_iters = 1  # This is enough to remove variance since # of iterations is large
     # p_types = ["cp", "tp", "dp"]
-    # p_types = ["cp"]
+    p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
     # p_types = ["tp", "dp"]
@@ -409,9 +459,9 @@ if __name__ == "__main__":
     # max_batch_size_arr = [32, 128, 512]
 
     # Debug
-    # max_kv_cache_context_lens = [[10000]]
-    # num_seqs_arr = [32]#, 128]
-    # max_batch_size_arr = [32]
+    max_kv_cache_context_lens = [[10000]]
+    num_seqs_arr = [32]#, 128]
+    max_batch_size_arr = [32]
 
     # Setting for throughput vs. latency
     # seq_len (10000) - max_batch_size (512), 40000 - 128, 80000 - 64
@@ -419,53 +469,11 @@ if __name__ == "__main__":
     # num_seqs_arr = [16, 32, 64, 128, 256, 512]
     # max_batch_size_arr = [16, 32, 64, 128, 256, 512]
 
-    # for n_idx, (n_seqs, max_bs) in enumerate(zip(num_seqs_arr, max_batch_size_arr)):
-    #     for cache_len in max_kv_cache_context_lens[n_idx]:
-    #         for p_type in p_types:
-    #             eval_cfg.p_type = p_type
-    #             eval_cfg.max_kv_cache_context_len = cache_len
-    #             eval_cfg.num_seqs = n_seqs
-    #             eval_cfg.max_batch_size = max_bs
-    #
-    #             check_eval_configs(eval_cfg)
-    #             torch.multiprocessing.spawn(run_distributed_model,
-    #                                         args=(eval_cfg,),
-    #                                         nprocs=eval_cfg.n_gpus,
-    #                                         join=True)
-
-    # Long decode: Throughput vs. seqnuence length
-    eval_cfg.output_file_path = "/home/byungsoj/eval_results/long-decode-0308.json"
-    eval_cfg.n_eval_iters = 1 # This is enough to remove variance since # of iterations is large
-    eval_cfg.max_kv_cache_context_len = 10000
-
-    p_types = ["cp", "tp", "dp"]
-    # p_types = ["cp"]
-    # p_types = ["dp"]
-    # p_types = ["tp"]
-
-    n_min_decode_iters_arr, n_max_decode_iters_arr = [], []
-    min_seq_len_multiplier = 0.2
-    n_max_decode_iters_arr.append([i for i in range(10000, 50001, 10000)])
-    n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
-    n_max_decode_iters_arr.append([i for i in range(5000, 25001, 5000)])
-    n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
-    n_max_decode_iters_arr.append([i for i in range(1000, 5001, 1000)])
-    n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
-    num_seqs_arr = [32, 128, 512]
-    max_batch_size_arr = [32, 128, 512]
-
-    # Debug
-    # n_min_decode_iters_arr = [[500, 1500, 2500]]
-    # n_max_decode_iters_arr = [[1000, 2000, 3000]]
-    # num_seqs_arr = [512]
-    # max_batch_size_arr = [512]
-
     for n_idx, (n_seqs, max_bs) in enumerate(zip(num_seqs_arr, max_batch_size_arr)):
-        for n_min_decode_iters, n_max_decode_iters in zip(n_min_decode_iters_arr[n_idx], n_max_decode_iters_arr[n_idx]):
+        for cache_len in max_kv_cache_context_lens[n_idx]:
             for p_type in p_types:
                 eval_cfg.p_type = p_type
-                eval_cfg.n_min_decode_iters = n_min_decode_iters
-                eval_cfg.n_max_decode_iters = n_max_decode_iters
+                eval_cfg.max_kv_cache_context_len = cache_len
                 eval_cfg.num_seqs = n_seqs
                 eval_cfg.max_batch_size = max_bs
 
@@ -474,3 +482,45 @@ if __name__ == "__main__":
                                             args=(eval_cfg,),
                                             nprocs=eval_cfg.n_gpus,
                                             join=True)
+
+    # Long decode: Throughput vs. seqnuence length
+    # eval_cfg.output_file_path = "/home/byungsoj/eval_results/long-decode-0308.json"
+    # eval_cfg.n_eval_iters = 1 # This is enough to remove variance since # of iterations is large
+    # eval_cfg.max_kv_cache_context_len = 10000
+
+    # p_types = ["cp", "tp", "dp"]
+    # p_types = ["cp"]
+    # p_types = ["dp"]
+    # p_types = ["tp"]
+
+    # n_min_decode_iters_arr, n_max_decode_iters_arr = [], []
+    # min_seq_len_multiplier = 0.2
+    # n_max_decode_iters_arr.append([i for i in range(10000, 50001, 10000)])
+    # n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
+    # n_max_decode_iters_arr.append([i for i in range(5000, 25001, 5000)])
+    # n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
+    # n_max_decode_iters_arr.append([i for i in range(1000, 5001, 1000)])
+    # n_min_decode_iters_arr.append([int(min_seq_len_multiplier * n_max_d_iters) for n_max_d_iters in n_max_decode_iters_arr[-1]])
+    # num_seqs_arr = [32, 128, 512]
+    # max_batch_size_arr = [32, 128, 512]
+
+    # Debug
+    # n_min_decode_iters_arr = [[500, 1500, 2500]]
+    # n_max_decode_iters_arr = [[1000, 2000, 3000]]
+    # num_seqs_arr = [512]
+    # max_batch_size_arr = [512]
+
+    # for n_idx, (n_seqs, max_bs) in enumerate(zip(num_seqs_arr, max_batch_size_arr)):
+    #     for n_min_decode_iters, n_max_decode_iters in zip(n_min_decode_iters_arr[n_idx], n_max_decode_iters_arr[n_idx]):
+    #         for p_type in p_types:
+    #             eval_cfg.p_type = p_type
+    #             eval_cfg.n_min_decode_iters = n_min_decode_iters
+    #             eval_cfg.n_max_decode_iters = n_max_decode_iters
+    #             eval_cfg.num_seqs = n_seqs
+    #             eval_cfg.max_batch_size = max_bs
+    #
+    #             check_eval_configs(eval_cfg)
+    #             torch.multiprocessing.spawn(run_distributed_model,
+    #                                         args=(eval_cfg,),
+    #                                         nprocs=eval_cfg.n_gpus,
+    #                                         join=True)

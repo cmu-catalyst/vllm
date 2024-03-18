@@ -26,12 +26,14 @@ def _distributed_paged_attention(
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    batch_size = len(input_metadata.context_lens)
-    query = query[:batch_size, :, :]
+    # batch_size = len(input_metadata.context_lens)
+    # query = query[:batch_size, :, :]
+    n_rank0_batch_size = input_metadata.n_rank0_batch_size
 
     block_size = value_cache.shape[3]
     num_seqs, num_heads, head_size = query.shape
 
+    # print(f"(rank, n_seqs, n_heads, head_size) = ({rank}, {num_seqs}, {num_heads}, {head_size})")
     max_num_partitions = (
             (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
             _PARTITION_SIZE)
@@ -66,35 +68,79 @@ def _distributed_paged_attention(
         alibi_slopes,
     )
 
-    num_seqs_per_rank = num_seqs // world_size
-    seq_idx_st =  rank * num_seqs_per_rank
-    seq_idx_end = seq_idx_st + num_seqs_per_rank
+    local_output = None
+    if rank > 0:
+        local_output = output[n_rank0_batch_size:,:,:]
+        # print("(rank, local_output_shape) = ", rank, local_output.shape)
 
-    exp_sums = exp_sums[seq_idx_st:seq_idx_end, :, 0].contiguous()
-    max_logits = max_logits[seq_idx_st:seq_idx_end, :, 0].contiguous()
-    output = output[seq_idx_st:seq_idx_end, :, :]
+    exp_sums = exp_sums[:n_rank0_batch_size, :, 0].contiguous()
+    max_logits = max_logits[:n_rank0_batch_size, :, 0].contiguous()
+    output = output[:n_rank0_batch_size, :, :]
 
-    exp_sums_list = [torch.empty_like(exp_sums) for _ in range(world_size)]
-    max_logits_list = [torch.empty_like(max_logits) for _ in range(world_size)]
-    output_list = [torch.empty_like(output) for _ in range(world_size)] #  [num_seqs, num_heads, head_size]
+    exp_sums_list, max_logits_list, output_list = None, None, None
+    if rank == 0: # Receive from other GPUs
+        exp_sums_list = [torch.empty_like(exp_sums) for _ in range(world_size)]
+        max_logits_list = [torch.empty_like(max_logits) for _ in range(world_size)]
+        output_list = [torch.empty_like(output) for _ in range(world_size)] #  [num_seqs, num_heads, head_size]
 
-    # Note(Soo): Reduce results
-    torch.distributed.all_gather(max_logits_list, max_logits)
-    torch.distributed.all_gather(exp_sums_list, exp_sums)
-    torch.distributed.all_gather(output_list, output)
+    torch.distributed.gather(exp_sums, gather_list=exp_sums_list, dst=0)
+    torch.distributed.gather(max_logits, gather_list=max_logits_list, dst=0)
+    torch.distributed.gather(output, gather_list=output_list, dst=0)
 
-    max_logits_list = torch.stack(max_logits_list, dim=-1)
-    exp_sums_list = torch.stack(exp_sums_list, dim=-1)
-    output_list = torch.stack(output_list, dim=-2)
+    # if rank == 0:
+    #     print("rank, exp_sum, max_logits, output: ", rank, exp_sums_list[0].shape, max_logits_list[0].shape, output_list[0].shape)
+    # else:
+    #     print("rank, exp_sum, max_logits, output: ", rank, exp_sums_list, max_logits_list, output_list)
 
-    global_output = torch.zeros_like(output)
-    ops.distributed_paged_attention_v2_reduce(
-        global_output,
-        exp_sums_list,
-        max_logits_list,
-        output_list,
-        world_size
-    )
+    if rank == 0:
+        max_logits_list = torch.stack(max_logits_list, dim=-1)
+        exp_sums_list = torch.stack(exp_sums_list, dim=-1)
+        output_list = torch.stack(output_list, dim=-2)
+
+        global_output = torch.zeros_like(output)
+        ops.distributed_paged_attention_v2_reduce(
+            global_output,
+            exp_sums_list,
+            max_logits_list,
+            output_list,
+            world_size
+        )
+
+    if rank > 0:
+        global_output = local_output
+    # print("rank, global output shape: ", rank, global_output.shape)
+
+    return global_output
+
+    # num_seqs_per_rank = num_seqs // world_size
+    # seq_idx_st =  rank * num_seqs_per_rank
+    # seq_idx_end = seq_idx_st + num_seqs_per_rank
+    #
+    # exp_sums = exp_sums[seq_idx_st:seq_idx_end, :, 0].contiguous()
+    # max_logits = max_logits[seq_idx_st:seq_idx_end, :, 0].contiguous()
+    # output = output[seq_idx_st:seq_idx_end, :, :]
+    #
+    # exp_sums_list = [torch.empty_like(exp_sums) for _ in range(world_size)]
+    # max_logits_list = [torch.empty_like(max_logits) for _ in range(world_size)]
+    # output_list = [torch.empty_like(output) for _ in range(world_size)] #  [num_seqs, num_heads, head_size]
+    #
+    # # Note(Soo): Reduce results
+    # torch.distributed.all_gather(max_logits_list, max_logits)
+    # torch.distributed.all_gather(exp_sums_list, exp_sums)
+    # torch.distributed.all_gather(output_list, output)
+    #
+    # max_logits_list = torch.stack(max_logits_list, dim=-1)
+    # exp_sums_list = torch.stack(exp_sums_list, dim=-1)
+    # output_list = torch.stack(output_list, dim=-2)
+    #
+    # global_output = torch.zeros_like(output)
+    # ops.distributed_paged_attention_v2_reduce(
+    #     global_output,
+    #     exp_sums_list,
+    #     max_logits_list,
+    #     output_list,
+    #     world_size
+    # )
 
 
     return global_output
@@ -131,7 +177,7 @@ class DistributedPagedAttention(nn.Module):
         value: torch.Tensor,
         key_cache: Optional[torch.Tensor],
         value_cache: Optional[torch.Tensor],
-        input_metadata: InputMetadata,
+        input_metadata: InputMetadata
     ) -> torch.Tensor:
         """PagedAttention forward pass.
 
@@ -199,7 +245,7 @@ class CacheParallelDecodeLlamaAttention(LlamaDecodeAttention):
             num_kv_heads=self.num_kv_heads,
             rank=self.rank
         )
-        self.do_all_gather = True
+        self.do_broadcast = True
 
     def forward(
         self,

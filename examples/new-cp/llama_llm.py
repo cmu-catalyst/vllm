@@ -77,7 +77,7 @@ class LlamaDecodeAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        self.do_all_gather = False
+        self.do_broadcast = False
 
     def forward(
         self,
@@ -89,11 +89,22 @@ class LlamaDecodeAttention(nn.Module):
         # Replicated qkv projection across GPUs
         qkv = self.qkv_proj(hidden_states)
 
-        if self.do_all_gather:
-            qkv_list = [torch.empty_like(qkv) for _ in range(self.n_gpus)]
-            torch.distributed.all_gather(qkv_list, qkv)
-            qkv = torch.cat(qkv_list, dim=0)
+        if self.do_broadcast:
+            # HACK(Soo): Assume rank 0 is always the one dealing with long sequence that requires CP
+            # print(self.rank, qkv.shape)
+            if self.rank == 0:
+                qkv_rank0 = qkv
+                # print("prepare attn (rank 0): ", qkv_rank0.shape)
+            else:
+                qkv_rank0 = torch.zeros([input_metadata.n_rank0_batch_size, qkv.shape[1], qkv.shape[2]],
+                                        device=self.device, dtype=self.dtype)
+                # print("prepare attn: ", self.rank, qkv_rank0.shape)
 
+            torch.distributed.broadcast(qkv_rank0, src=0)
+
+            if self.rank > 0:
+                qkv = torch.cat([qkv_rank0, qkv], dim=0)
+            # print("after merge: ", self.rank, qkv.shape)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # FIXME(Soo): Enable rotary embedding
         # q, k = self.rotary_emb(positions, q, k)

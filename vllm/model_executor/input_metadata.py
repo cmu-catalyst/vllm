@@ -22,6 +22,7 @@ class InputMetadata:
         context_lens: Optional[torch.Tensor],
         block_tables: Optional[torch.Tensor],
         use_cuda_graph: bool,
+        n_rank0_batch_size: Optional[int] = 0,
     ) -> None:
         self.is_prompt = is_prompt
         self.max_context_len = max_context_len
@@ -29,6 +30,7 @@ class InputMetadata:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.use_cuda_graph = use_cuda_graph
+        self.n_rank0_batch_size = n_rank0_batch_size
 
         # Set during the execution of the first attention op.
         # FIXME(woosuk): This is a hack.

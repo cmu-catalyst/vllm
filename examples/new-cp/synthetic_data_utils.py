@@ -54,7 +54,7 @@ def gen_random_kv_cache(
 
     return kv_caches
 
-def gen_block_table_and_slot_mapping(num_blocks, num_seqs, context_lens, block_size, device):
+def gen_block_table_and_slot_mapping(num_blocks, num_seqs, context_lens, max_len, block_size, device):
     # We aim to make the best use of memory footprint by keeping key, value cache
     # in a contiguous space; still, it wouldn't matter much to performance
     # since CUDA kernel reads each token at a time from physical address
@@ -63,7 +63,7 @@ def gen_block_table_and_slot_mapping(num_blocks, num_seqs, context_lens, block_s
     # HACK(Soo): If KV cache size goes beyond available memory, we reuse existing KV cache for computation
     block_tables = []
     total_num_blocks = 0
-    max_len = max(context_lens) # Need to make torch.tensor shape
+    # max_len = max(context_lens) # Need to make torch.tensor shape
     for i in range(num_seqs):
         max_num_blocks_per_seq = (max_len + block_size - 1) // block_size
         block_table = [
