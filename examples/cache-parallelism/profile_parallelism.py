@@ -114,7 +114,7 @@ def init_context_lens(
         n_gpus: int,
         device: torch.device,
         long_seq_ratio: float = 0.2,
-        min_seq_len_multiplier: float = 0.2,
+        min_seq_len_multiplier: float = 0.1,
         min_seq_len: int = 10,
 ):
     min_kv_cache_context_len = max(int(min_seq_len_multiplier * max_kv_cache_context_len), min_seq_len)
@@ -126,9 +126,11 @@ def init_context_lens(
         if i >= n_long_seqs:
             start_len = min_kv_cache_context_len
             end_len = min(2 * min_kv_cache_context_len, max_kv_cache_context_len)
-            context_lens[i] = (random.randint(start_len, end_len) // n_gpus) * n_gpus
+            # context_lens[i] = (random.randint(start_len, end_len) // n_gpus) * n_gpus
+            context_lens[i] = random.randint(start_len, end_len) // n_gpus
 
-            n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
+            # n_decode_iters = (random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus) * n_gpus
+            n_decode_iters = random.randint(n_min_decode_iters, n_max_decode_iters) // n_gpus
             target_context_lens[i] = context_lens[i] + n_decode_iters
 
     # Fair load balancing for DP (in case of long prefix case)
@@ -416,7 +418,7 @@ if __name__ == "__main__":
     # Long prefix: Throughput vs. seqnuence length
     eval_cfg.output_file_path = "/home/byungsoj/eval_results/profile-result.json"
     eval_cfg.n_eval_iters = 1  # This is enough to remove variance since # of iterations is large
-    p_types = ["cp", "tp", "dp"]
+    p_types = ["tp", "dp"]
     # p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
@@ -429,9 +431,9 @@ if __name__ == "__main__":
     # max_batch_size_arr = [32, 128, 512]
 
     # Debug
-    # max_kv_cache_context_lens = [[50000], [50000], [10000]]
-    max_kv_cache_context_lens = []
-    max_kv_cache_context_lens.append([i for i in range(60000, 100001, 10000)])
+    max_kv_cache_context_lens = [[10000]]
+    # max_kv_cache_context_lens = []
+    # max_kv_cache_context_lens.append([i for i in range(60000, 100001, 10000)])
     num_seqs_arr = [32]#, 128]
     max_batch_size_arr = [32]
 
@@ -448,7 +450,7 @@ if __name__ == "__main__":
                 eval_cfg.max_kv_cache_context_len = cache_len
                 eval_cfg.num_seqs = n_seqs
                 eval_cfg.max_batch_size = max_bs
-                eval_cfg.trace_dir_path = f"/home/byungsoj/eval_results/prof_traces/trace_b{n_seqs}_s{cache_len}_{p_type}"
+                eval_cfg.trace_dir_path = f"/home/byungsoj/eval_results/prof_traces/round2/trace_b{n_seqs}_s{cache_len}_{p_type}"
 
                 check_eval_configs(eval_cfg)
                 torch.multiprocessing.spawn(run_distributed_model,
