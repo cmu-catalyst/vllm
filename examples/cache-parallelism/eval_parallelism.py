@@ -396,10 +396,10 @@ if __name__ == "__main__":
 
     # HACK(Soo): There is no limit on context len now because of hack to share KV cache when it overflows
     # Long prefix: Throughput vs. seqnuence length
-    eval_cfg.output_file_path = "/home/byungsoj/eval_results/test.json"
+    eval_cfg.output_file_path = "/home/byungsoj/eval_results/final_result/round2/lat-thru-trade-off-0318.json"
     eval_cfg.n_eval_iters = 1  # This is enough to remove variance since # of iterations is large
-    # p_types = ["cp", "tp", "dp"]
-    p_types = ["cp"]
+    p_types = ["cp", "tp", "dp"]
+    # p_types = ["cp"]
     # p_types = ["dp"]
     # p_types = ["tp"]
     # p_types = ["tp", "dp"]
@@ -412,15 +412,16 @@ if __name__ == "__main__":
     # max_batch_size_arr = [32, 128, 512]
 
     # Debug
-    max_kv_cache_context_lens = [[10000]]
-    num_seqs_arr = [32]#, 128]
-    max_batch_size_arr = [32]
+    max_kv_cache_context_lens = [[10000, 40000, 80000]]
+    num_seqs_arr = [16]#, 128]
+    max_batch_size_arr = [16]
 
     # Setting for throughput vs. latency
     # seq_len (10000) - max_batch_size (512), 40000 - 128, 80000 - 64
-    # max_kv_cache_context_lens = [10000, 40000, 80000]
-    # num_seqs_arr = [16, 32, 64, 128, 256, 512]
-    # max_batch_size_arr = [16, 32, 64, 128, 256, 512]
+    # max_kv_cache_context_lens = [[10000, 40000, 80000], [10000, 40000, 80000], [10000, 40000, 80000],
+    #                              [10000, 40000, 80000], [10000, 40000, 80000]]
+    # num_seqs_arr = [32, 64, 128, 256, 512]
+    # max_batch_size_arr = [32, 64, 128, 256, 512]
 
     for n_idx, (n_seqs, max_bs) in enumerate(zip(num_seqs_arr, max_batch_size_arr)):
         for cache_len in max_kv_cache_context_lens[n_idx]:
